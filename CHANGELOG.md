@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A status hook that calls `session.reset()` no longer turns the answer that
+  fired it into a stale request: its caller gets the status it was answered
+  with, and only what is still on its way is dropped
+
 ## 2.0.0 — 2026-11-11
 
 The first release of this fork. It continues from upstream RESTe at its

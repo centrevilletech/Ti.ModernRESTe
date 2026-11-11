@@ -135,6 +135,7 @@ function createPipeline(state) {
 			deadlineTimer: null,
 			unwatch: null,
 			shared: null,
+			answered: false,
 			lead: true,
 			retryPolicy: undefined,
 			cacheKey: null,
@@ -1074,6 +1075,9 @@ function createPipeline(state) {
 			fail(ctx, error);
 			return;
 		}
+		// The server has answered this request: a hook that ends the session (the usual thing to do after a
+		// 401) drops what is still on its way, not the answer that made it do so.
+		ctx.answered = true;
 		let episode = state.episodes[status];
 		if (!episode || episode.generation !== state.generation || (!episode.pending && ctx.sentSeq > episode.seq)) {
 			episode = state.episodes[status] = { seq: ++state.seq, generation: state.generation, decision: undefined, pending: null };
@@ -1284,7 +1288,7 @@ function createPipeline(state) {
 	/** Ends the current session: requests that belong to it are dropped (see Reste#session.reset). */
 	function dropStale(abortInFlight) {
 		Array.from(state.active).forEach((ctx) => {
-			if (ctx.endpoint.session === false || ctx.generation === state.generation) {
+			if (ctx.endpoint.session === false || ctx.generation === state.generation || ctx.answered) {
 				return;
 			}
 			if (ctx.background) {

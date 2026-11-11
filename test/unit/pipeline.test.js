@@ -311,6 +311,20 @@ describe('status hooks', () => {
 		assert.deepEqual(seen, [false, true]);
 	});
 
+	it('a hook that resets the session leaves the request that fired it its own answer', async () => {
+		const { api } = make({ onStatus: { 401: () => { api.session.reset(); } } });
+		ti.respond(() => null);
+		const answered = api.list();
+		const onItsWay = api.get({ id: 1 });
+		ti.requests[0].respond({ status: 401, body: { code: 'UNAUTHENTICATED' } });
+		const [first, second] = await Promise.all([rejection(answered), rejection(onItsWay)]);
+		assert.equal(first.kind, 'http'); // the server answered this one: its caller hears the 401
+		assert.equal(first.status, 401);
+		assert.deepEqual(first.body, { code: 'UNAUTHENTICATED' });
+		assert.equal(second.kind, 'stale'); // still on its way: dropped with the session
+		assert.equal(ti.requests[1].aborted, true);
+	});
+
 	it('a hook that throws does not break the request', async () => {
 		const { api } = make({ logger: () => {}, onStatus: { 500: () => { throw new Error('hook bug'); } } });
 		ti.respond(() => ({ status: 500 }));

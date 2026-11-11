@@ -515,7 +515,8 @@ api.session.reset();          // sign-out, "session expired", sign-in, a differe
 
 Requests that were in flight are aborted and reject with `kind: 'stale'`; a
 response that still arrives is dropped, and a request that was waiting to be
-retried is not sent. Nothing of the previous session reaches a callback, a
+retried is not sent. A request the server has already answered keeps its
+answer: the 401 whose status hook calls `reset()` still rejects with that 401. Nothing of the previous session reaches a callback, a
 global error handler or a collection, and nothing of it is sent with the next
 session's credentials. The cache (memory and persistent store), idempotency
 actions, identity maps and the collections' paging state are cleared.
