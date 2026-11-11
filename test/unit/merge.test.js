@@ -493,6 +493,19 @@ eachBackbone((Backbone, version) => {
 			assert.equal(job.has('done'), false);
 		});
 
+		it('rollback puts an attribute that was null back as null, not as absent', async () => {
+			make();
+			const job = Alloy.Collections.jobs.get(2);
+			job.set({ archived_at: null });
+			ti.respond(() => ({ status: 500 }));
+			await rejection(job.save({ archived_at: 'now' }, { optimistic: true }));
+			assert.equal(job.get('archived_at'), null);
+			assert.equal('archived_at' in job.attributes, true);
+			await rejection(job.optimistic({ archived_at: 'later' }, () => Promise.reject(new Error('refused'))));
+			assert.equal(job.get('archived_at'), null);
+			assert.equal('archived_at' in job.attributes, true);
+		});
+
 		it('fires the error event on rollback when there is no error callback', async () => {
 			make();
 			ti.respond(() => ({ status: 500 }));

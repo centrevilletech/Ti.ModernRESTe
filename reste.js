@@ -4446,7 +4446,7 @@
 				}
 				const previous = {};
 				Object.keys(attrs).forEach((name) => {
-					previous[name] = model.has(name) ? model.get(name) : undefined;
+					previous[name] = has(model.attributes, name) ? model.get(name) : undefined; // null is a value
 				});
 				const userError = settings.error;
 				let release = noop;
@@ -4509,7 +4509,7 @@
 			function optimisticChange(model, changes, send) {
 				const previous = {};
 				Object.keys(changes).forEach((name) => {
-					previous[name] = model.has(name) ? model.get(name) : undefined;
+					previous[name] = has(model.attributes, name) ? model.get(name) : undefined; // null is a value
 				});
 				model.set(changes);
 				const release = holdAttributes(model, Object.keys(changes));

@@ -17,6 +17,9 @@
 
 ### Fixed
 
+- Rolling back an optimistic change removed an attribute whose value had been
+  `null` (Backbone's `has()` is false for it) instead of restoring the `null`
+
 - A status hook that calls `session.reset()` no longer turns the answer that
   fired it into a stale request: its caller gets the status it was answered
   with, and only what is still on its way is dropped
