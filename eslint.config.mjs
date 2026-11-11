@@ -30,7 +30,7 @@ export default [
 			ecmaVersion: 2017,
 			globals: {
 				Ti: 'readonly', Alloy: 'readonly', Backbone: 'readonly', console: 'readonly', setTimeout: 'readonly',
-				clearTimeout: 'readonly', module: 'writable', require: 'readonly'
+				clearTimeout: 'readonly', module: 'writable', require: 'readonly', WeakRef: 'readonly'
 			}
 		},
 		rules: { 'no-restricted-globals': ['error', 'process', 'Buffer', 'global', '__dirname'] }
