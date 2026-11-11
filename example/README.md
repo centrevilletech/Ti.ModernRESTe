@@ -56,18 +56,20 @@ Titanium SDK 13.4.1.GA, Alloy 3.0.1, Backbone 1.4.0: all 48 checks pass on both 
 
 | | Android 15 (x86_64 container, software rendering) | iOS 27.0 simulator (iPhone 18 Pro) |
 | --- | --- | --- |
-| `config()` with 500 methods | 1 ms | under 1 ms |
-| GET 500 items (148 kB) from localhost | 21 ms | 7 ms |
-| first fetch of 500 items into a collection | 78 ms, 1 render | 25 ms, 1 render |
-| fetch again, nothing changed | 28 ms, 0 renders, not parsed | 8 ms, 0 renders, not parsed |
-| fetch again, 10 of 500 changed | 74 ms, 1 render | 7 ms, 1 render |
-| merging 2000 items, longest block | 66 ms whole, 55 ms with `chunk: 100` | 42 ms whole, 26 ms with `chunk: 100` |
+| `config()` with 500 methods | 1 to 3 ms | under 1 ms |
+| GET 500 items (148 kB) from localhost | 21 to 24 ms | 4 to 7 ms |
+| first fetch of 500 items into a collection | 78 to 143 ms, 1 render | 7 to 25 ms, 1 render |
+| fetch again, nothing changed | 28 to 85 ms, 0 renders, not parsed | 5 to 15 ms, 0 renders, not parsed |
+| fetch again, 10 of 500 changed | 66 to 105 ms, 1 render | 4 to 15 ms, 1 render |
+| merging 2000 items, longest block | 66 to 177 ms whole, 19 to 94 ms with `chunk: 100` | 12 to 42 ms whole, 6 to 26 ms with `chunk: 100` |
 | timeout as the platform reports it | `"timeout"`, code -1001 | `"The request timed out."`, code -1001 |
 | dropped connection | `"unexpected end of stream on ..."`, code -1 | `"The network connection was lost."`, code -1005 |
 | conditional GET, server answers 304 | status 304 | status 200 (the stored response) |
 | upload progress events for 3 MB | 6145 from the platform, 101 passed on | 1 |
 | `DELETE` with a body | the body is dropped by the platform | sent |
+| a boolean in a flat form body | `remember=true` | `remember=1` |
 
-Times include the HTTP exchange with a server on the same machine and vary
-from run to run by a factor of two on these virtual devices; they are not
-phone numbers. The counts do not vary.
+Times are the range over six runs on Android and three on iOS. They include
+the HTTP exchange with a server on the same machine, on virtual devices that
+share their host with other work, so they vary by a factor of three and are
+not phone numbers. The counts, and what each platform reports, do not vary.
