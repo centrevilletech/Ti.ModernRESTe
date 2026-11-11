@@ -30,7 +30,8 @@ const { isFunction } = require('./util');
  *
  * Cursor pagination adds loadOlder() (= loadMore) and loadNewer().
  *
- * deps: { Events, collection, pagination, content, request(query, signal) -> handle, merge(items) -> result }
+ * deps: { Events, collection, pagination, content, request(params, query, signal) -> handle,
+ *         merge(items) -> result, track(promise) }
  */
 function createLiveList(deps, options) {
 	const collection = deps.collection;
@@ -235,6 +236,9 @@ function createLiveList(deps, options) {
 	function settle(promise, how, more) {
 		const mine = generation;
 		failedMore = false;
+		if (deps.track) {
+			deps.track(promise); // optimistic writes stay protected until this load has landed
+		}
 		return promise.then((page) => {
 			if (destroyed || mine !== generation || page.discarded) {
 				return page;

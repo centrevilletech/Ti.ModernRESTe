@@ -187,15 +187,70 @@ eachBackbone((Backbone, version) => {
 			await collection.fetch();
 			const model = collection.get('a1');
 			assert.equal(model.id, 'a1');
-			assert.equal(model.idAttribute, 'objectId');
 			assert.equal(model.get('id'), 'a1');
 			assert.equal(model.get('objectId'), 'a1');
+		});
+
+		it('a model made with { id } is that model: save updates, destroy deletes, fetch reads (as in 1.x)', async () => {
+			const { api } = make();
+			ti.respond(() => ({ status: 200, body: { objectId: 'a', name: 'From the server' } }));
+			const model = api.createModel('location', { id: 'a', name: 'Local' });
+			assert.equal(model.isNew(), false);
+			assert.equal(model.id, 'a');
+			await model.save({ name: 'Changed' });
+			assert.equal(ti.last.method, 'PUT');
+			assert.equal(ti.last.url, 'https://api.test/v1/locations/a');
+			await model.fetch();
+			assert.equal(ti.last.method, 'GET');
+			assert.equal(ti.last.url, 'https://api.test/v1/locations/a');
+			const destroyed = [];
+			await model.destroy({ success: () => destroyed.push(true) });
+			assert.equal(ti.last.method, 'DELETE');
+			assert.equal(ti.last.url, 'https://api.test/v1/locations/a');
+			assert.deepEqual(destroyed, [true]);
+		});
+
+		it('a model made with only the configured id attribute is that model too', async () => {
+			const { api } = make();
+			ti.respond(() => ({ status: 200, body: {} }));
+			const model = api.createModel('location', { objectId: 'b', name: 'Local' });
+			assert.equal(model.isNew(), false);
+			assert.equal(model.id, 'b');
+			assert.equal(model.get('id'), 'b');
+			await model.save({ name: 'Changed' });
+			assert.equal(ti.last.url, 'https://api.test/v1/locations/b');
+		});
+
+		it('a collection finds models by id however they were added', async () => {
+			make();
+			const collection = Alloy.Collections.locations;
+			collection.add({ id: 'z', name: 'Added with id' });
+			collection.add({ objectId: 'y', name: 'Added with the configured attribute' });
+			assert.equal(collection.get('z').get('name'), 'Added with id');
+			assert.equal(collection.get('y').get('name'), 'Added with the configured attribute');
+			await collection.fetch({ merge: true });
+			assert.equal(collection.get('a1').get('name'), 'Home');
+			collection.upsert({ objectId: 'a1', name: 'Merged by the configured attribute' });
+			collection.upsert({ id: 'b2', name: 'Merged by id' });
+			assert.equal(collection.length, 2);
+			assert.deepEqual(collection.pluck('name'), ['Merged by the configured attribute', 'Merged by id']);
+		});
+
+		it('destroying a model nobody saved sends nothing and reports it', async () => {
+			const { api } = make();
+			const model = api.createModel('location', { name: 'Never saved' });
+			assert.equal(model.isNew(), true);
+			assert.equal(model.destroy(), false);
+			assert.equal(ti.requests.length, 0);
 		});
 
 		it('can stop mirroring the id', async () => {
 			make({ models: [locationModel({ mirrorId: false })] });
 			await Alloy.Collections.locations.fetch();
-			assert.equal(Alloy.Collections.locations.get('a1').has('id'), false);
+			const model = Alloy.Collections.locations.get('a1');
+			assert.equal(model.has('id'), false);
+			assert.equal(model.idAttribute, 'objectId');
+			assert.equal(model.id, 'a1');
 		});
 
 		it('does not overwrite `id` when a model has no id configured', async () => {

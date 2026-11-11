@@ -83,7 +83,7 @@ describe('requests', () => {
 	it('form-encodes when the content type says so, or the method is marked form', async () => {
 		const { api } = make({ methods: [{ name: 'login', post: 'login', form: true }, { name: 'legacy', post: 'legacy', headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }] });
 		await api.login({ body: { user: 'a', remember: true } });
-		assert.deepEqual(ti.last.body, { user: 'a', remember: 'true' });
+		assert.deepEqual(ti.last.body, { user: 'a', remember: true }); // flat values reach the HTTP client as given, as in 1.x
 		assert.equal(ti.last.headers['Content-Type'], 'application/x-www-form-urlencoded');
 		await api.legacy({ body: { user: 'b' } });
 		assert.deepEqual(ti.last.body, { user: 'b' });
@@ -109,6 +109,15 @@ describe('requests', () => {
 		const { api } = make({ methods: [{ name: 'search', get: 'search?q=<query>' }] });
 		await api.search({ query: 'two words' });
 		assert.equal(ti.last.url, 'https://api.test/v1/search?q=two%20words');
+	});
+
+	it('an empty string is a missing value in the path, and a value in the query string', async () => {
+		const { api } = make({ methods: [{ name: 'find', get: 'things/<id>?name=<name>&where={"x": "<x>"}' }] });
+		const error = await rejection(api.find({ id: '', name: 'n', x: 'y' }));
+		assert.deepEqual([error.kind, error.missing], ['params', ['id']]);
+		await api.find({ id: 7, name: '', x: '' });
+		assert.equal(ti.last.url, 'https://api.test/v1/things/7?name=&where={"x": ""}');
+		assert.equal((await rejection(api.find({ id: 7, name: null, x: '' }))).kind, 'params');
 	});
 
 	it('rejects, and never throws, when a path parameter is missing', async () => {
@@ -295,13 +304,42 @@ describe('headers', () => {
 		assert.deepEqual(ti.last.headers, { A: '2', c: '4' });
 	});
 
-	it('can keep default headers away from one method', async () => {
+	it('default headers stay on the API\'s origin: a full URL elsewhere does not get the token', async () => {
 		const { api } = make({
-			requestHeaders: { Authorization: 'Bearer secret' },
-			methods: [{ name: 'geo', get: 'https://maps.example/geocode', globalHeaders: false, headers: { 'X-Key': 'k' } }]
+			requestHeaders: { Authorization: () => 'Bearer secret' },
+			methods: [
+				{ name: 'geo', get: 'https://maps.example/geocode', headers: { 'X-Key': 'k' } },
+				{ name: 'upload', put: () => 'https://bucket.example/object?signature=abc' },
+				{ name: 'sameOrigin', get: 'https://API.test/v2/other' },
+				{ name: 'otherPort', get: 'https://api.test:8443/v1/x' },
+				{ name: 'optedIn', get: 'https://partner.example/x', globalHeaders: true },
+				{ name: 'optedOut', get: 'inside', globalHeaders: false },
+				{ name: 'relative', get: 'inside' }
+			]
 		});
 		await api.geo();
 		assert.deepEqual(ti.last.headers, { 'X-Key': 'k' });
+		await api.upload({ body: 'bytes' });
+		assert.equal(ti.last.headers.Authorization, undefined);
+		await api.otherPort();
+		assert.equal(ti.last.headers.Authorization, undefined);
+		await api.sameOrigin();
+		assert.equal(ti.last.headers.Authorization, 'Bearer secret');
+		await api.optedIn();
+		assert.equal(ti.last.headers.Authorization, 'Bearer secret');
+		await api.optedOut();
+		assert.equal(ti.last.headers.Authorization, undefined);
+		await api.relative();
+		assert.equal(ti.last.headers.Authorization, 'Bearer secret');
+	});
+
+	it('default headers follow setUrl(): the origin is the one in use when the call is made', async () => {
+		const { api } = make({ requestHeaders: { Authorization: 'Bearer secret' }, methods: [{ name: 'staging', get: 'https://staging.test/x' }] });
+		await api.staging();
+		assert.equal(ti.last.headers.Authorization, undefined);
+		api.setUrl('https://staging.test/v1/');
+		await api.staging();
+		assert.equal(ti.last.headers.Authorization, 'Bearer secret');
 	});
 });
 

@@ -13,25 +13,24 @@ const ABSOLUTE = /^[a-z][a-z0-9+.-]*:\/\//i;
 function compileTemplate(source) {
 	const literals = [];
 	const names = [];
+	const inQuery = []; // per placeholder: it sits after the "?" (an empty value is fine there)
 	let last = 0;
 	let match;
 	PLACEHOLDER.lastIndex = 0;
 	while ((match = PLACEHOLDER.exec(source)) !== null) {
 		literals.push(source.slice(last, match.index));
 		names.push(match[1]);
+		inQuery.push(source.lastIndexOf('?', match.index) !== -1);
 		last = match.index + match[0].length;
 	}
 	literals.push(source.slice(last));
-	return { source, literals, names };
-}
-
-function isMissing(value) {
-	return value === null || value === undefined || value === '';
+	return { source, literals, names, inQuery };
 }
 
 /**
  * Fills a compiled template. Objects are sent as JSON, as upstream did. Throws a ResteError('params') naming
- * every placeholder that has no value.
+ * every placeholder that has no value: null and undefined anywhere, and an empty string in the path (where
+ * it would turn `things/<id>` into the URL of the whole list), but not in the query string.
  */
 function fillTemplate(template, params, encode, endpointName) {
 	const names = template.names;
@@ -43,7 +42,7 @@ function fillTemplate(template, params, encode, endpointName) {
 	let missing = null;
 	for (let i = 0; i < names.length; i++) {
 		let value = params ? params[names[i]] : undefined;
-		if (isMissing(value)) {
+		if (value === null || value === undefined || (value === '' && !template.inQuery[i])) {
 			(missing || (missing = [])).push(names[i]);
 		} else {
 			if (isObject(value)) {
@@ -176,16 +175,22 @@ function joinUrl(base, path) {
  * Flattens a body for multipart or form encoding, because Titanium's HTTP client takes one flat dictionary:
  * `{ photos: [a, b], meta: { note: 'x' } }` -> `{ 'photos[0]': a, 'photos[1]': b, 'meta[note]': 'x' }`.
  * A key that already ends in `[]` keeps its name: `'photos[]': [a, b]` -> `photos[0]`, `photos[1]`.
- * null and undefined are left out; booleans and numbers become strings; binary values pass through.
+ * null and undefined are left out; booleans and numbers become strings (with `keepPrimitives`, top-level
+ * ones are passed as they are); binary values pass through.
  */
-function flattenFields(body) {
+function flattenFields(body, keepPrimitives) {
 	const out = {};
 	if (!body) {
 		return out;
 	}
 	const keys = Object.keys(body);
 	for (let i = 0; i < keys.length; i++) {
-		flattenField(out, keys[i], body[keys[i]]);
+		const value = body[keys[i]];
+		if (keepPrimitives && (typeof value === 'number' || typeof value === 'boolean')) {
+			out[keys[i]] = value; // a flat form body reaches the HTTP client exactly as 1.x passed it
+		} else {
+			flattenField(out, keys[i], value);
+		}
 	}
 	return out;
 }

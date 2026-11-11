@@ -8,6 +8,7 @@ const transport = require('./transport');
 const { isFunction, isObject, has, noop, now, getPath, headerKey, hashString, later } = require('./util');
 
 const EMPTY = Object.freeze({});
+const ORIGIN = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]+/i;
 const STALE = { stale: true };
 
 /**
@@ -137,6 +138,8 @@ function createPipeline(state) {
 			lead: true,
 			retryPolicy: undefined,
 			cacheKey: null,
+			cacheBase: null,
+			cacheStamp: null,
 			cachePolicy: null,
 			cacheEntry: null,
 			hookRetried: null
@@ -233,7 +236,11 @@ function createPipeline(state) {
 	function resolveHeaders(ctx) {
 		const out = {};
 		const endpoint = ctx.endpoint;
-		if (endpoint.globalHeaders !== false) {
+		// Default headers (a bearer token, usually) belong to the configured API: a method with a full URL
+		// on another origin gets them only when its definition says `globalHeaders: true`.
+		const wanted = endpoint.globalHeaders !== undefined ? endpoint.globalHeaders
+			: !endpoint.absolute || sameOrigin(ctx.url, state.config.url);
+		if (wanted) {
 			const globals = state.headers;
 			for (let i = 0; i < globals.length; i++) {
 				const value = isFunction(globals[i].value) ? globals[i].value() : globals[i].value;
@@ -252,6 +259,12 @@ function createPipeline(state) {
 			out[state.idempotency.header] = ctx.idempotencyKey;
 		}
 		return out;
+	}
+
+	function sameOrigin(url, base) {
+		const a = ORIGIN.exec(String(url || ''));
+		const b = ORIGIN.exec(String(base || ''));
+		return Boolean(a && b && a[0].toLowerCase() === b[0].toLowerCase());
 	}
 
 	function mergeHeaders(out, layer) {
@@ -305,12 +318,47 @@ function createPipeline(state) {
 
 	// ---------------------------------------------------------------- sending
 
+	/** True when the session this request belongs to has ended. */
+	function outdated(ctx) {
+		return ctx.endpoint.session !== false && ctx.generation !== state.generation;
+	}
+
+	function staleError(ctx) {
+		return ResteError('stale', 'RESTe :: the session ended while ' + ctx.endpoint.name + ' was in flight');
+	}
+
+	/**
+	 * A request that cannot be sent (a header function, hook or interceptor threw, the session ended while it
+	 * waited): it fails for its caller and for every identical request that joined it, always on a later
+	 * turn, so a call never throws and never calls back before it returned.
+	 */
+	function abandon(ctx, error) {
+		Promise.resolve().then(() => {
+			if (ctx.shared) {
+				settle(ctx, { error, status: 0, http: null, body: undefined });
+			} else {
+				failed(ctx, error);
+			}
+		});
+	}
+
 	function attempt(ctx) {
 		if (dead(ctx)) {
 			return;
 		}
+		if (outdated(ctx)) {
+			// A retry that was waiting, or a hook's "retry", after the session ended: the next user's
+			// credentials must never be put on the previous user's request.
+			abandon(ctx, staleError(ctx));
+			return;
+		}
 		ctx.attempt++;
-		ctx.headers = resolveHeaders(ctx);
+		try {
+			ctx.headers = resolveHeaders(ctx);
+		} catch (error) {
+			abandon(ctx, toResteError(error));
+			return;
+		}
 		const chain = interceptorsFor(ctx, 'request');
 		if (!chain) {
 			afterInterceptors(ctx);
@@ -338,11 +386,11 @@ function createPipeline(state) {
 			try {
 				returned = chain[index++](request);
 			} catch (error) {
-				failed(ctx, toResteError(error));
+				abandon(ctx, toResteError(error));
 				return;
 			}
 			if (returned && isFunction(returned.then)) {
-				returned.then(step, error => failed(ctx, toResteError(error)));
+				returned.then(step, error => abandon(ctx, toResteError(error)));
 			} else {
 				step(returned);
 			}
@@ -369,35 +417,47 @@ function createPipeline(state) {
 				next();
 				return;
 			}
-			hook(ctx.body === undefined ? {} : ctx.body, (result) => {
-				if (dead(ctx)) {
-					return;
-				}
-				if (result && result.skip) {
-					// Upstream: the hook stopped the call and its value goes to the success callback.
-					deliver(ctx, result, null, true);
-					return;
-				}
-				if (result !== undefined) {
-					ctx.body = result;
-				}
-				next();
-			});
+			try {
+				hook(ctx.body === undefined ? {} : ctx.body, (result) => {
+					if (dead(ctx)) {
+						return;
+					}
+					if (result && result.skip) {
+						// Upstream: the hook stopped the call and its value goes to the success callback.
+						deliver(ctx, result, null, true);
+						return;
+					}
+					if (result !== undefined) {
+						ctx.body = result;
+					}
+					next();
+				});
+			} catch (error) {
+				abandon(ctx, toResteError(error));
+			}
 		};
 		run(beforePost, () => run(beforeSend, () => dispatch(ctx)));
 	}
 
 	function dispatch(ctx) {
-		if (ctx.attempt === 1 || ctx.redispatch) {
-			ctx.redispatch = false;
-			if (ctx.method === 'GET' && !ctx.endpoint.download) {
-				if (lookupCache(ctx)) {
+		try {
+			if (ctx.attempt === 1 || ctx.redispatch) {
+				ctx.redispatch = false;
+				if (ctx.method === 'GET' && !ctx.endpoint.download) {
+					if (lookupCache(ctx)) {
+						return;
+					}
+				}
+				if (joinInflight(ctx)) {
 					return;
 				}
 			}
-			if (joinInflight(ctx)) {
-				return;
+		} catch (error) {
+			if (ctx.settled) {
+				throw error; // the caller's own callback threw while a cached answer was delivered
 			}
+			abandon(ctx, toResteError(error)); // a cache key function that throws
+			return;
 		}
 		transmit(ctx);
 	}
@@ -414,9 +474,11 @@ function createPipeline(state) {
 		ctx.cachePolicy = policy;
 		let key;
 		if (isFunction(policy.key)) {
-			key = policy.key(describe(ctx));
+			key = String(policy.key(describe(ctx)));
+			ctx.cacheBase = key;
 		} else {
 			key = 'GET ' + ctx.url;
+			ctx.cacheBase = key;
 			if (policy.vary) {
 				for (let i = 0; i < policy.vary.length; i++) {
 					const name = headerKey(ctx.headers, policy.vary[i]);
@@ -424,11 +486,17 @@ function createPipeline(state) {
 				}
 			}
 		}
+		const scope = state.cacheScope;
+		if (scope !== null && scope !== undefined) {
+			key += '\nscope:' + (isFunction(scope) ? scope() : scope);
+		}
 		ctx.cacheKey = key;
+		// Remembered from before the request is sent: an invalidation in the meantime wins over its answer.
+		ctx.cacheStamp = state.cache.stamp(ctx.cacheBase, ctx.endpoint.name);
 		if (options.cache === 'reload' || options.force === true) {
 			return false;
 		}
-		const hit = state.cache.lookup(key);
+		const hit = state.cache.lookup(key, ctx.endpoint.name, name => requestHeader(ctx, name));
 		if (!hit) {
 			return false;
 		}
@@ -453,6 +521,16 @@ function createPipeline(state) {
 		return false;
 	}
 
+	/** False when the cache was invalidated for this request after it was sent: its answer is not kept. */
+	function current(ctx) {
+		return ctx.cacheStamp === state.cache.stamp(ctx.cacheBase, ctx.endpoint.name);
+	}
+
+	function requestHeader(ctx, name) {
+		const key = headerKey(ctx.headers, name);
+		return key ? ctx.headers[key] : '';
+	}
+
 	function cachedResponse(ctx, entry, stale) {
 		const response = new Response(ctx, entry.status, null);
 		response.fromCache = true;
@@ -474,6 +552,12 @@ function createPipeline(state) {
 		let key = ctx.method + ' ' + ctx.url;
 		for (let i = 0; i < names.length; i++) {
 			key += '\n' + names[i] + ':' + ctx.headers[names[i]];
+		}
+		// A conditional request may be answered 304, which only a caller holding that entry can use; and a
+		// request never joins one of another session.
+		key += '\nif:' + (ctx.cacheEntry ? ctx.cacheEntry.etag || ctx.cacheEntry.lastModified || '' : '');
+		if (endpoint.session !== false) {
+			key += '\nsession:' + ctx.generation;
 		}
 		const shared = state.inflight.get(key);
 		if (shared) {
@@ -504,7 +588,7 @@ function createPipeline(state) {
 			if (!typeKey) {
 				headers['Content-Type'] = 'application/x-www-form-urlencoded';
 			}
-			return isObject(body) ? flattenFields(body) : body;
+			return isObject(body) ? flattenFields(body, true) : body;
 		}
 		if (body === undefined) {
 			if (ctx.method === 'DELETE') {
@@ -525,6 +609,30 @@ function createPipeline(state) {
 			headers['Content-Type'] = 'application/json';
 		}
 		return JSON.stringify(body);
+	}
+
+	/**
+	 * The URL as it may be printed: sensitive query values replaced, and the values of path placeholders that
+	 * are named like a credential (`<token>`) or that the method lists in `redact`.
+	 */
+	function loggedUrl(ctx) {
+		const log = logger();
+		const endpoint = ctx.endpoint;
+		let url = ctx.url;
+		if (endpoint.secretParams === undefined) {
+			endpoint.secretParams = endpoint.template.names.filter(name => log.sensitive(name) || (endpoint.redact && endpoint.redact.indexOf(name) !== -1));
+		}
+		const params = ctx.params;
+		if (params) {
+			for (let i = 0; i < endpoint.secretParams.length; i++) {
+				const value = params[endpoint.secretParams[i]];
+				if (value !== undefined && value !== null && value !== '') {
+					const text = isObject(value) ? JSON.stringify(value) : String(value);
+					url = url.split(encodeURIComponent(text)).join(log.redacted).split(text).join(log.redacted);
+				}
+			}
+		}
+		return log.redactUrl(url, describe(ctx));
 	}
 
 	function transmit(ctx) {
@@ -569,6 +677,11 @@ function createPipeline(state) {
 			return;
 		}
 
+		if (outdated(ctx)) {
+			// An interceptor or a hook held the request past the end of its session.
+			abandon(ctx, staleError(ctx));
+			return;
+		}
 		ctx.sentSeq = ++state.seq;
 		if (config.failWhenOffline && typeof Ti !== 'undefined' && Ti.Network && Ti.Network.online === false) {
 			// Asked not to wait for a timeout when the device already knows it has no connection.
@@ -577,7 +690,7 @@ function createPipeline(state) {
 		}
 		const log = logger();
 		if (log.enabled) {
-			log.log(method + ' ' + log.redactUrl(ctx.url) + (ctx.attempt > 1 ? ' (attempt ' + ctx.attempt + ')' : ''));
+			log.log(method + ' ' + loggedUrl(ctx) + (ctx.attempt > 1 ? ' (attempt ' + ctx.attempt + ')' : ''));
 			if (log.verbose) {
 				log.log('headers', log.redactHeaders(headers));
 				if (ctx.body !== undefined) {
@@ -605,6 +718,7 @@ function createPipeline(state) {
 			const kind = classifyFailure(event, result.elapsed, ctx.timeout);
 			error = ResteError(kind, kind === 'timeout' ? 'RESTe :: the request timed out' : 'RESTe :: ' + (event.error || 'the request failed'), {
 				cause: event,
+				error: event.error != null ? String(event.error) : undefined,
 				source: result.http,
 				offline: typeof Ti !== 'undefined' && Ti.Network ? Ti.Network.online === false : false,
 				code: event.code !== undefined ? event.code : 0
@@ -619,7 +733,7 @@ function createPipeline(state) {
 			if (policy && !dead(ctx) && shouldRetry(policy, error, ctx.attempt, {
 				method: ctx.method,
 				idempotencyKey: ctx.idempotencyKey,
-				endpointRetry: ctx.endpoint.repeatable || (ctx.options.retry !== undefined && ctx.options.retry !== false),
+				endpointRetry: ctx.endpoint.repeatable,
 				name: ctx.endpoint.name
 			})) {
 				const delay = retryDelay(policy, ctx.attempt, error, state.random);
@@ -655,6 +769,7 @@ function createPipeline(state) {
 			headers,
 			retryAfter: parseRetryAfter(headers['retry-after']),
 			cause: event,
+			error: event.error != null ? String(event.error) : 'HTTP error',
 			source: http,
 			code: result.status
 		});
@@ -715,7 +830,9 @@ function createPipeline(state) {
 		const entry = ctx.cacheEntry;
 		if (entry && (outcome.status === 304
 			|| (outcome.status === 200 && entry.etag && transport.readHeader(http, 'ETag') === entry.etag))) {
-			state.cache.revalidated(ctx.cacheKey, ctx.cacheEntry, ctx.cachePolicy, transport.readHeaders(http));
+			if (current(ctx)) {
+				state.cache.revalidated(ctx.cacheKey, ctx.cacheEntry, ctx.cachePolicy, transport.readHeaders(http));
+			}
 			const cached = cachedResponse(ctx, ctx.cacheEntry, false);
 			cached.notModified = true;
 			cached.http = http;
@@ -750,13 +867,13 @@ function createPipeline(state) {
 			response.body = outcome.body;
 		}
 		shape(ctx, response);
-		if (ctx.cachePolicy && ctx.cacheKey && outcome.status >= 200 && outcome.status < 300) {
+		if (ctx.cachePolicy && ctx.cacheKey && outcome.status >= 200 && outcome.status < 300 && current(ctx)) {
 			state.cache.store(ctx.cacheKey, endpoint.name, ctx.cachePolicy, {
 				status: outcome.status,
 				body: response.body,
 				text: ctx.cachePolicy.persist ? transport.readText(http) : null,
 				headers: response.headers
-			});
+			}, name => requestHeader(ctx, name));
 		}
 		return response;
 	}
@@ -863,10 +980,17 @@ function createPipeline(state) {
 			}
 		};
 		const local = isFunction(endpoint.onLoad) ? value => endpoint.onLoad(value, last, response) : last;
-		if (!skipped && isFunction(config.onLoad)) {
-			config.onLoad(data, local, response);
-		} else {
-			local(data);
+		try {
+			if (!skipped && isFunction(config.onLoad)) {
+				config.onLoad(data, local, response);
+			} else {
+				local(data);
+			}
+		} catch (error) {
+			if (ctx.settled) {
+				throw error; // the caller's own callback: theirs to see, as in 1.x
+			}
+			fail(ctx, decorate(toResteError(error), ctx)); // a hook threw before the call was answered
 		}
 	}
 
@@ -889,6 +1013,10 @@ function createPipeline(state) {
 			return;
 		}
 		decorate(error, ctx);
+		if (error.kind === 'stale' || error.kind === 'cancelled') {
+			fail(ctx, error); // nothing to recover, map or announce
+			return;
+		}
 		const policy = ctx.cachePolicy;
 		if (!afterResponse && policy && policy.staleIfError && ctx.cacheEntry
 			&& (error.kind === 'network' || error.kind === 'timeout' || error.status >= 500)) {
@@ -975,7 +1103,12 @@ function createPipeline(state) {
 			}
 			const decision = episode.decision;
 			const again = decision === 'retry' || (isObject(decision) && decision.retry === true);
-			if (again && !(ctx.hookRetried && ctx.hookRetried[status]) && ctx.generation === state.generation) {
+			// Sending again is allowed for a request that is safe to repeat, and for any request after a status
+			// that means "refused before anything was done" (401 by default: config.authStatuses).
+			const safe = ctx.method === 'GET' || ctx.method === 'HEAD' || Boolean(ctx.idempotencyKey) || ctx.endpoint.repeatable
+				|| state.authStatuses.indexOf(status) !== -1;
+			// (attempt() refuses a request whose session ended while the hook was working.)
+			if (again && safe && !(ctx.hookRetried && ctx.hookRetried[status])) {
 				(ctx.hookRetried || (ctx.hookRetried = {}))[status] = true;
 				ctx.redispatch = true;
 				ctx.cacheEntry = null;
@@ -1038,7 +1171,10 @@ function createPipeline(state) {
 		} else if (isFunction(config.onError)) {
 			config.onError(value, retry);
 		} else if (ctx.onLoad) {
-			if (config.errorsToOnLoad) {
+			// 1.x passed an error nobody handles to the success callback. Apps that still ask for 1.x's error
+			// values (`errorsAsObjects: false`) get that too, so a screen written for it does not wait forever.
+			const toOnLoad = config.errorsToOnLoad !== undefined ? config.errorsToOnLoad : config.errorsAsObjects === false;
+			if (toOnLoad) {
 				ctx.onLoad(value, retry);
 			} else {
 				logger().always('unhandled error for ' + endpoint.name + ': ' + error.message
@@ -1062,9 +1198,9 @@ function createPipeline(state) {
 		if (log.enabled) {
 			const took = (now() - ctx.startedAt) + 'ms';
 			if (error) {
-				log.warn(ctx.method + ' ' + log.redactUrl(ctx.url) + ' failed: ' + (error.status || error.kind) + ' in ' + took);
+				log.warn(ctx.method + ' ' + loggedUrl(ctx) + ' failed: ' + (error.status || error.kind) + ' in ' + took);
 			} else if (response) {
-				log.log(ctx.method + ' ' + log.redactUrl(ctx.url) + ' ' + response.status
+				log.log(ctx.method + ' ' + loggedUrl(ctx) + ' ' + response.status
 					+ (response.fromCache ? (response.notModified ? ' (not modified)' : response.stale ? ' (stale cache)' : ' (cache)') : '') + ' in ' + took);
 			}
 		}

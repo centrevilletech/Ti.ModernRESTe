@@ -23,6 +23,9 @@ const RESERVED = Object.create(null);
 
 const VERBS = ['post', 'get', 'put', 'patch', 'delete', 'head']; // upstream's order: the last one defined wins
 
+/** How many compiled URLs a method whose URL is a function keeps. */
+const MAX_VARIANTS = 32;
+
 function Reste() {
 	if (!(this instanceof Reste)) {
 		return new Reste();
@@ -37,6 +40,8 @@ function Reste() {
 		idempotency: { header: 'Idempotency-Key', methods: [] },
 		retry: null,
 		cacheDefaults: null,
+		cacheScope: null,
+		authStatuses: [401],
 		pagination: null,
 		cache: createCache({}),
 		keys: createKeys(uuid),
@@ -122,6 +127,7 @@ function Reste() {
 			session: def.session,
 			statusHooks: def.statusHooks,
 			interceptors: def.interceptors || null,
+			redact: def.redact ? [].concat(def.redact) : null,
 			clientOptions: def.clientOptions,
 			securityManager: def.securityManager
 		};
@@ -141,12 +147,17 @@ function Reste() {
 			return endpoint;
 		}
 		const source = String(endpoint.dynamic());
-		const cache = record.variants || (record.variants = Object.create(null));
-		if (!cache[source]) {
-			cache[source] = compile(record.def, source);
-			cache[source].dynamic = null;
+		let cache = record.variants || (record.variants = new Map());
+		let variant = cache.get(source);
+		if (!variant) {
+			if (cache.size >= MAX_VARIANTS) {
+				cache = record.variants = new Map(); // a URL that keeps changing must not grow this forever
+			}
+			variant = compile(record.def, source);
+			variant.dynamic = null;
+			cache.set(source, variant);
 		}
-		return cache[source];
+		return variant;
 	}
 
 	function invoke(record, params, a, b, c) {
@@ -251,6 +262,8 @@ function Reste() {
 		const cache = isObject(config.cache) ? config.cache : {};
 		state.cacheDefaults = normalizeCachePolicy(isObject(cache.defaults) ? cache.defaults : true, null);
 		state.cache = createCache({ maxEntries: cache.maxEntries, store: cache.store, prefix: cache.prefix });
+		state.cacheScope = cache.scope === undefined ? null : cache.scope;
+		state.authStatuses = Array.isArray(config.authStatuses) ? config.authStatuses.map(Number) : [401];
 
 		state.interceptors = { request: [], response: [], error: [] };
 		if (config.interceptors) {
@@ -459,9 +472,10 @@ function Reste() {
 				url = endpoint.absolute ? url : joinUrl(state.config.url, url);
 				const query = Object.assign({}, endpoint.query, params && isObject(params.query) && !endpoint.queryIsParam ? params.query : null);
 				if (Object.keys(query).length) {
-					url = withQuery(url, serializeQuery(query, state.queryOptions));
+					url = withQuery(url, isFunction(state.config.querySerializer) ? state.config.querySerializer(query)
+						: serializeQuery(query, state.queryOptions));
 				}
-				return state.cache.invalidate(null, 'GET ' + url);
+				return state.cache.invalidate(matcher, 'GET ' + url);
 			}
 			return state.cache.invalidate(matcher);
 		},
@@ -524,6 +538,17 @@ function Reste() {
 	 */
 	reste.list = function (options) {
 		return data.liveList(options);
+	};
+
+	/** Numbers for finding leaks: what is in flight, cached and kept per method and per model. */
+	reste.inspect = function () {
+		const variants = {};
+		records.forEach((record, name) => {
+			if (record.variants) {
+				variants[name] = record.variants.size;
+			}
+		});
+		return { inFlight: state.active.size, shared: state.inflight.size, cache: state.cache.size, variants, identity: data.identity.sizes() };
 	};
 
 	reste.collections = data.collections;

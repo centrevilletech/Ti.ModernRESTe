@@ -58,6 +58,19 @@ describe('cancellation', () => {
 		assert.equal((await rejection(handle)).kind, 'cancelled');
 	});
 
+	it('abort() during a retry back-off leaves no timer behind', async () => {
+		const timers = () => process.getActiveResourcesInfo().filter(name => name === 'Timeout').length;
+		const { api } = make({ retry: { retries: 2, baseDelay: 60000, jitter: 0 } });
+		ti.respond(() => ({ status: 503 }));
+		const before = timers();
+		const handle = api.list();
+		await wait(5);
+		assert.equal(timers(), before + 1); // waiting a minute for the second attempt
+		handle.abort();
+		assert.equal(timers(), before);
+		await rejection(handle);
+	});
+
 	it('a signal cancels every request it was given', async () => {
 		const { api, Reste } = make();
 		const controller = Reste.createAbortController();

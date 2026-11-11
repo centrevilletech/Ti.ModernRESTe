@@ -5,13 +5,17 @@ const { ResteError } = require('./errors');
 
 /**
  * The attributes of `incoming` that differ from `current`, or null when none do. Keys `incoming` lacks are
- * left alone: a list row usually carries fewer fields than the detail of the same resource.
+ * left alone: a list row usually carries fewer fields than the detail of the same resource. `pending` names
+ * attributes to leave alone as well (optimistic changes in flight).
  */
-function diffAttributes(current, incoming) {
+function diffAttributes(current, incoming, pending) {
 	let diff = null;
 	const keys = Object.keys(incoming);
 	for (let i = 0; i < keys.length; i++) {
 		const key = keys[i];
+		if (pending && pending[key] > 0) {
+			continue; // changed on the device, not answered by the server yet: the device's value stands
+		}
 		const a = current[key];
 		const b = incoming[key];
 		if (a === b) {
@@ -67,7 +71,9 @@ function createMerger(batch) {
 	function upsert(collection, items, settings) {
 		const Model = settings.Model || collection.model;
 		const idAttribute = settings.idAttribute || 'id';
-		const mirror = settings.mirrorId && idAttribute !== 'id';
+		const sourceId = settings.sourceId || idAttribute;
+		const mirror = Boolean(settings.mirrorId) && sourceId !== idAttribute;
+		const destroying = settings.destroying && settings.destroying.size ? settings.destroying : null;
 		const identity = settings.identity || null;
 		const replace = settings.mode === 'replace';
 		const coalesce = settings.events !== 'each';
@@ -126,12 +132,15 @@ function createMerger(batch) {
 							model = attrs;
 						}
 					} else {
-						if (mirror && attrs.id === undefined && attrs[idAttribute] !== undefined) {
-							attrs = Object.assign({ id: attrs[idAttribute] }, attrs);
+						if (mirror && attrs.id === undefined && attrs[sourceId] != null) {
+							attrs = Object.assign({ id: attrs[sourceId] }, attrs);
+						}
+						if (destroying && destroying.has(attrs[idAttribute])) {
+							continue; // being deleted on the device: this response was asked for before that
 						}
 						model = find(attrs[idAttribute]);
 						if (model) {
-							const diff = diffAttributes(model.attributes, attrs);
+							const diff = diffAttributes(model.attributes, attrs, model._pendingAttrs);
 							if (diff) {
 								model.set(diff);
 								job.changed.push(model);
@@ -175,14 +184,24 @@ function createMerger(batch) {
 		function settleReplace() {
 			const desired = [];
 			const wanted = new Set();
+			const gone = settings.destroying && settings.destroying.size ? settings.destroying : null;
 			job.models.forEach((model) => {
-				if (!wanted.has(model)) {
+				// (A model whose optimistic destroy began while this merge was running stays out.)
+				if (!wanted.has(model) && !(gone && gone.has(model.id))) {
 					wanted.add(model);
 					desired.push(model);
 				}
 			});
-			job.models = desired;
+			job.models = desired.slice();
 			const current = collection.models;
+			// A model that was created on the device and is still being sent is not in the server's list
+			// yet: it keeps its place.
+			current.forEach((model, index) => {
+				if (model._pendingCreate && !wanted.has(model)) {
+					wanted.add(model);
+					desired.splice(Math.min(index, desired.length), 0, model);
+				}
+			});
 			const had = new Set(current);
 			job.removed = current.filter(model => !wanted.has(model));
 			job.added = desired.filter(model => !had.has(model));

@@ -3,8 +3,11 @@
 const { ResteError } = require('./errors');
 const { createMerger, diffAttributes, isCoalesced, touch } = require('./merge');
 const { createLiveList } = require('./list');
+const { createIdentityMap } = require('./identity');
 const { normalizePagination, createPager, readPage } = require('./pagination');
 const { isFunction, isObject, isPlainObject, has, noop, getPath, deepEqual, hashString } = require('./util');
+
+const notAborted = () => false;
 
 /** Options of fetch / save / destroy that are passed on to the request. */
 const CALL_OPTIONS = ['headers', 'timeout', 'signal', 'retry', 'cache', 'force', 'dedupe', 'deadline', 'idempotencyKey',
@@ -19,8 +22,41 @@ const CALL_OPTIONS = ['headers', 'timeout', 'signal', 'retry', 'cache', 'force',
 function createData(reste, state) {
 	const batch = { depth: 0, dirty: new Map() };
 	const merger = createMerger(batch);
-	const records = Object.create(null); // model name -> { config, Model, idAttribute, mirrorId, identity }
+	const records = Object.create(null); // model name -> { config, Model, idAttribute, sourceId, mirrorId, identity, ... }
 	const collections = Object.create(null); // collection name -> collection
+
+	// List loads in flight. An optimistic write keeps its protection until every load that was asked for
+	// before the server answered the write has landed: such a load may still carry the old state.
+	const activeLoads = new Set();
+	let loadWaiters = [];
+
+	function trackLoad(promise) {
+		const token = {};
+		activeLoads.add(token);
+		const landed = () => {
+			activeLoads.delete(token);
+			const ready = [];
+			loadWaiters = loadWaiters.filter((waiter) => {
+				waiter.pending.delete(token);
+				if (waiter.pending.size === 0) {
+					ready.push(waiter.run);
+					return false;
+				}
+				return true;
+			});
+			ready.forEach(run => run());
+		};
+		promise.then(landed, landed);
+		return promise;
+	}
+
+	function whenLoadsLanded(run) {
+		if (activeLoads.size === 0) {
+			run();
+		} else {
+			loadWaiters.push({ pending: new Set(activeLoads), run });
+		}
+	}
 
 	function backbone() {
 		const found = state.config.Backbone
@@ -54,7 +90,7 @@ function createData(reste, state) {
 	/** A promise that carries the request's abort(), and never reports "unhandled" for Backbone-style callers. */
 	function derive(handle, onFulfilled, onRejected) {
 		const result = handle.then(onFulfilled, onRejected);
-		result.abort = result.cancel = handle.abort || noop;
+		result.abort = result.cancel = handle.abort || notAborted;
 		result.idempotencyKey = handle.idempotencyKey || null;
 		result.catch(noop);
 		return result;
@@ -63,7 +99,7 @@ function createData(reste, state) {
 	function rejected(error, options, target) {
 		const handle = Promise.reject(error);
 		handle.catch(noop);
-		handle.abort = handle.cancel = noop;
+		handle.abort = handle.cancel = notAborted;
 		Promise.resolve().then(() => {
 			if (options && isFunction(options.error)) {
 				options.error(error);
@@ -74,9 +110,13 @@ function createData(reste, state) {
 		return handle;
 	}
 
+	/**
+	 * 1.x kept Backbone's id in `id` and copied the configured attribute (`objectId`, say) into it for
+	 * everything the server sent. Attributes that only have the configured one get `id` here.
+	 */
 	function mirrored(record, attrs) {
-		if (record.mirrorId && isPlainObject(attrs) && attrs.id === undefined && attrs[record.idAttribute] !== undefined) {
-			return Object.assign({ id: attrs[record.idAttribute] }, attrs);
+		if (record.mirrorId && isPlainObject(attrs) && attrs.id === undefined && attrs[record.sourceId] != null) {
+			return Object.assign({ id: attrs[record.sourceId] }, attrs);
 		}
 		return attrs;
 	}
@@ -104,7 +144,7 @@ function createData(reste, state) {
 		if (record.mirrorId) {
 			delete body.id;
 		}
-		delete body[record.idAttribute];
+		delete body[record.sourceId];
 		return body;
 	}
 
@@ -114,7 +154,7 @@ function createData(reste, state) {
 		const params = {};
 		let methodName;
 		if (model.id != null) {
-			params[record.idAttribute] = model.id;
+			params[record.sourceId] = model.id;
 			params.id = model.id;
 		}
 		if (method === 'create' && model.id != null) {
@@ -251,8 +291,10 @@ function createData(reste, state) {
 			previous[name] = model.has(name) ? model.get(name) : undefined;
 		});
 		const userError = settings.error;
+		let release = noop;
 		settings.error = function (target, error) {
 			const failure = error === undefined ? target : error;
+			release();
 			const restore = {};
 			const drop = [];
 			Object.keys(attrs).forEach((name) => {
@@ -275,7 +317,35 @@ function createData(reste, state) {
 				model.trigger('error', model, failure, settings); // 0.9.2 only fires "error" without a callback
 			}
 		};
-		return Base.prototype.save.call(model, attrs, settings);
+		const request = Base.prototype.save.call(model, attrs, settings);
+		if (request && isFunction(request.then)) {
+			release = holdAttributes(model, Object.keys(attrs));
+			request.then(() => whenLoadsLanded(release), release);
+		}
+		return request;
+	}
+
+	/**
+	 * Marks attributes as changed on the device and not yet answered by the server: a list response that was
+	 * requested before the change must not put the old values back. Returns the function that lifts the mark.
+	 */
+	function holdAttributes(model, names) {
+		const pending = model._pendingAttrs || (model._pendingAttrs = {});
+		names.forEach((name) => {
+			pending[name] = (pending[name] || 0) + 1;
+		});
+		let released = false;
+		return function () {
+			if (released) {
+				return;
+			}
+			released = true;
+			names.forEach((name) => {
+				if (--pending[name] <= 0) {
+					delete pending[name];
+				}
+			});
+		};
 	}
 
 	function optimisticChange(model, changes, send) {
@@ -284,7 +354,9 @@ function createData(reste, state) {
 			previous[name] = model.has(name) ? model.get(name) : undefined;
 		});
 		model.set(changes);
+		const release = holdAttributes(model, Object.keys(changes));
 		const result = Promise.resolve().then(send).then((resource) => {
+			whenLoadsLanded(release);
 			if (isPlainObject(resource)) {
 				const diff = diffAttributes(model.attributes, resource);
 				if (diff) {
@@ -294,6 +366,7 @@ function createData(reste, state) {
 			}
 			return model;
 		}, (error) => {
+			release();
 			Object.keys(changes).forEach((name) => {
 				if (deepEqual(model.get(name), changes[name])) {
 					if (previous[name] === undefined) {
@@ -318,14 +391,17 @@ function createData(reste, state) {
 	function optimisticAdd(meta, collection, attributes, send, options) {
 		const record = meta.record;
 		const model = new record.Model(mirrored(record, attributes));
+		model._pendingCreate = true; // a refresh that lands meanwhile must not drop it
 		collection.add(model, options);
 		meta.mutations++;
 		return Promise.resolve().then(send).then((resource) => {
 			if (isPlainObject(resource)) {
 				return settleCreated(meta, collection, model, mirrored(record, resource));
 			}
+			model._pendingCreate = false;
 			return model;
 		}, (error) => {
+			model._pendingCreate = false;
 			collection.remove(model);
 			model.trigger('rollback', model, error, {});
 			throw error;
@@ -336,6 +412,9 @@ function createData(reste, state) {
 	function settleCreated(meta, collection, model, resource) {
 		const record = meta.record;
 		const id = resource[record.idAttribute];
+		whenLoadsLanded(() => {
+			model._pendingCreate = false;
+		});
 		const existing = id != null && id !== model.id ? collection.get(id) || (record.identity ? record.identity.get(id) : null) : null;
 		if (existing && existing !== model) {
 			collection.remove(model);
@@ -376,8 +455,24 @@ function createData(reste, state) {
 			}
 		});
 		const userError = settings.error;
+		const id = model.id;
+		// Until the server has answered, a list response that still contains the model must not re-add it.
+		if (record) {
+			record.destroying.set(id, (record.destroying.get(id) || 0) + 1);
+		}
+		const settled = () => {
+			if (record) {
+				const left = (record.destroying.get(id) || 1) - 1;
+				if (left > 0) {
+					record.destroying.set(id, left);
+				} else {
+					record.destroying.delete(id);
+				}
+			}
+		};
 		settings.error = function (target, error) {
 			const failure = error === undefined ? target : error;
+			settled();
 			places.forEach((place) => {
 				if (place.collection.indexOf(model) === -1) {
 					place.collection.add(model, { at: Math.min(place.index, place.collection.length) });
@@ -393,24 +488,63 @@ function createData(reste, state) {
 				model.trigger('error', model, failure, settings);
 			}
 		};
-		return Base.prototype.destroy.call(model, settings);
+		const request = Base.prototype.destroy.call(model, settings);
+		if (request && isFunction(request.then)) {
+			request.then(() => whenLoadsLanded(settled), noop);
+		} else {
+			settled();
+		}
+		return request;
 	}
 
 	function addModel(args) {
 		const BB = backbone();
 		reste.modelConfig = reste.modelConfig || {};
 		reste.modelConfig[args.name] = args;
-		const idAttribute = args.id || 'id';
+		// 1.x: Backbone's id is `id`, and the attribute named in the config is copied into it. With
+		// `mirrorId: false` the configured attribute is Backbone's id and nothing is copied.
+		const sourceId = args.id || 'id';
+		const mirrorId = sourceId !== 'id' && args.mirrorId !== false;
+		const identityOption = args.identity !== undefined ? args.identity : state.config.identity;
 		const record = {
 			config: args,
-			idAttribute,
-			mirrorId: idAttribute !== 'id' && args.mirrorId !== false,
-			identity: (args.identity !== undefined ? args.identity : state.config.identity) ? new Map() : null,
+			sourceId,
+			idAttribute: mirrorId ? 'id' : sourceId,
+			mirrorId,
+			identity: null,
+			lists: [], // the collections of this model
+			destroying: new Map(), // id -> optimistic destroys the server has not answered yet
 			Model: null
 		};
+		if (identityOption) {
+			record.identity = createIdentityMap({
+				weak: isObject(identityOption) ? identityOption.weak : undefined,
+				limit: isObject(identityOption) ? identityOption.limit : undefined,
+				held: model => record.lists.some(list => (model.id != null ? list.get(model.id) === model : false))
+			});
+		}
 		const Base = BB.Model;
+		const baseSet = Base.prototype.set;
 		record.Model = Base.extend({
-			idAttribute,
+			idAttribute: record.idAttribute,
+			set(key, value, options) {
+				if (!mirrorId || key == null) {
+					return baseSet.call(this, key, value, options);
+				}
+				// However the attributes arrive (the constructor, collection.add, a merge), the configured
+				// id attribute also sets `id`.
+				let attrs = key;
+				let settings = value;
+				if (typeof key !== 'object') {
+					attrs = {};
+					attrs[key] = value;
+					settings = options;
+				}
+				if (attrs.id === undefined && attrs[sourceId] != null && !(settings && settings.unset)) {
+					attrs = Object.assign({ id: attrs[sourceId] }, attrs);
+				}
+				return baseSet.call(this, attrs, settings);
+			},
 			_type: args.name,
 			_method: args.name,
 			sync(method, model, options) {
@@ -496,7 +630,7 @@ function createData(reste, state) {
 			throw new Error('RESTe :: unknown model ' + name);
 		}
 		const attrs = {};
-		attrs[record.idAttribute] = id;
+		attrs[record.sourceId] = id;
 		return createModel(name, attrs);
 	}
 
@@ -536,6 +670,9 @@ function createData(reste, state) {
 			app.Collections[config.name] = collection;
 		}
 		collections[config.name] = collection;
+		if (record.lists.indexOf(collection) === -1) {
+			record.lists.push(collection);
+		}
 
 		const Base = BB.Collection.prototype;
 		const meta = {
@@ -603,7 +740,7 @@ function createData(reste, state) {
 		};
 
 		collection.hasMore = function () {
-			return meta.pager ? meta.pager.hasMore : false;
+			return meta.pager && meta.pager.loaded ? meta.pager.hasMore : false;
 		};
 
 		/** Merges items (from a socket, a push payload, another response) into the collection. */
@@ -631,6 +768,7 @@ function createData(reste, state) {
 			settings.error = function (target, error) {
 				const failure = error === undefined ? target : error;
 				if (created) {
+					created._pendingCreate = false;
 					self.remove(created);
 					created.trigger('rollback', created, failure, settings);
 				}
@@ -654,7 +792,20 @@ function createData(reste, state) {
 				}
 			};
 			delete settings.optimistic; // the model's own save must not try to roll attributes back
+			const userDone = settings.success;
+			settings.success = function () {
+				const model = created;
+				if (model) {
+					whenLoadsLanded(() => {
+						model._pendingCreate = false;
+					});
+				}
+				return userDone.apply(this, arguments);
+			};
 			created = Base.create.call(this, attributes, settings);
+			if (created) {
+				created._pendingCreate = created.isNew(); // a refresh that lands before the answer keeps it
+			}
 			return created;
 		};
 
@@ -672,8 +823,10 @@ function createData(reste, state) {
 		return {
 			Model: record.Model,
 			idAttribute: record.idAttribute,
+			sourceId: record.sourceId,
 			mirrorId: record.mirrorId,
 			identity: record.identity,
+			destroying: record.destroying,
 			mode,
 			position,
 			chunk: settings.chunk !== undefined ? settings.chunk : (config.chunk !== undefined ? config.chunk : state.config.chunk),
@@ -805,8 +958,8 @@ function createData(reste, state) {
 			throw error;
 		};
 		const finished = (promise, abortRequest) => {
-			const result = promise.then(null, fail);
-			result.abort = result.cancel = abortRequest || noop;
+			const result = trackLoad(promise).then(null, fail);
+			result.abort = result.cancel = abortRequest || notAborted;
 			result.catch(noop);
 			return result;
 		};
@@ -946,6 +1099,7 @@ function createData(reste, state) {
 			collection,
 			pagination,
 			content: settings.content !== undefined ? settings.content : meta.config.content,
+			track: trackLoad,
 			request(params, query, signal) {
 				const all = Object.assign({}, meta.config.params, isFunction(params) ? params() : params);
 				const merged = Object.assign({}, meta.config.query, isFunction(query) ? query() : query);
@@ -969,7 +1123,15 @@ function createData(reste, state) {
 		});
 		Object.keys(collections).forEach((name) => {
 			const collection = collections[name];
-			if (collection.paging !== undefined) {
+			const meta = collection._reste;
+			if (meta) {
+				// The next session starts from the first page, and nothing is "unchanged since last time".
+				if (meta.pager) {
+					meta.pager.reset();
+				}
+				meta.cleanAt = -1;
+				meta.lastUrl = meta.lastEtag = meta.lastHash = null;
+				meta.lastLength = -1;
 				collection.meta = null;
 				collection.paging = null;
 			}
@@ -1005,6 +1167,20 @@ function createData(reste, state) {
 						records[key].identity.clear();
 					}
 				});
+			},
+			/** How many models the identity map of a model holds. */
+			size(name) {
+				const record = records[name];
+				return record && record.identity ? record.identity.size : 0;
+			},
+			sizes() {
+				const out = {};
+				Object.keys(records).forEach((key) => {
+					if (records[key].identity) {
+						out[key] = records[key].identity.size;
+					}
+				});
+				return out;
 			}
 		}
 	};

@@ -17,7 +17,7 @@
  * Fields: status, body (parsed), headers (lower-cased names), url, method, endpoint (the method name),
  * retryAfter (ms, from Retry-After), attempts, idempotencyKey, cause (the HTTP client's error event).
  * For code written against upstream's `errorsAsObjects: true` the same values are also available under the
- * names upstream used: success (false), code, content, error, type, source.
+ * names upstream used: success (false), code, content, error (the platform's error text), type, source.
  */
 function ResteError(kind, message, details) {
 	const error = new Error(message || kind);
@@ -43,7 +43,9 @@ function ResteError(kind, message, details) {
 	// Upstream's `errorsAsObjects` shape.
 	error.success = false;
 	error.type = 'error';
-	error.error = error.message;
+	if (error.error === undefined) {
+		error.error = error.message; // HTTP and network errors keep the platform's text here, as in 1.x
+	}
 	if (error.code === undefined) {
 		error.code = error.status;
 	}

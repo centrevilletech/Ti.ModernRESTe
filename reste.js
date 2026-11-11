@@ -148,12 +148,23 @@
 			return out;
 		}
 
+		/** Response headers worth keeping on disk. Everything else (cookies above all) stays in memory only. */
+		const PERSISTED_HEADERS = ['etag', 'last-modified', 'cache-control', 'content-type', 'vary'];
+
+		/** Request headers that identify a user: a response that varies on one of them is never written to disk. */
+		const CREDENTIAL_HEADER = /authorization|cookie|token|secret|key|session/i;
+
 		/**
 		 * The HTTP response cache: memory first (least recently used entries are dropped past `maxEntries`), with an
 		 * optional persistent store behind it for entries whose policy says `persist: true`.
 		 *
-		 * A store is anything with getItem(key) -> string|null, setItem(key, string), removeItem(key) and, for
-		 * clear(), keys() -> string[]. `Reste.propertiesStore()` and `Reste.fileStore()` build one.
+		 * A store is anything with getItem(key) -> string|null, setItem(key, string), removeItem(key) and keys() ->
+		 * string[] (needed to invalidate and clear what a previous launch persisted). `Reste.fileStore()` and
+		 * `Reste.propertiesStore()` build one.
+		 *
+		 * Every entry belongs to a tag (the method that made it). An invalidation bumps a version for what it
+		 * covers; a request remembers the version from before it was sent (`stamp`) and its answer is only kept
+		 * when nothing invalidated it in the meantime.
 		 */
 		function createCache(options) {
 			const settings = options || {};
@@ -162,9 +173,26 @@
 			const now = settings.now || clock;
 			const prefix = settings.prefix || 'reste_';
 			const memory = new Map();
+			const versions = { all: 0, tags: new Map(), keys: new Map() };
 
-			function storeKey(key) {
-				return prefix + hashString(key) + key.length.toString(36);
+			function tagPrefix(tag) {
+				return prefix + hashString(String(tag || '')) + '_';
+			}
+
+			function storeKey(key, tag) {
+				return tagPrefix(tag) + hashString(key) + key.length.toString(36);
+			}
+
+			function stamp(key, tag) {
+				return versions.all + ':' + (versions.tags.get(tag) || 0) + ':' + (versions.keys.get(key) || 0);
+			}
+
+			function bumpKey(key) {
+				if (versions.keys.size > 500) {
+					versions.keys.clear();
+					versions.all++; // forget the per-key versions without making an older stamp look current
+				}
+				versions.keys.set(key, (versions.keys.get(key) || 0) + 1);
 			}
 
 			function remember(key, entry) {
@@ -175,45 +203,48 @@
 				}
 			}
 
-			function hydrate(key) {
+			function readStored(name) {
+				try {
+					const raw = store.getItem(name);
+					return raw ? JSON.parse(raw) : null;
+				} catch (error) {
+					return null;
+				}
+			}
+
+			function hydrate(key, tag) {
 				if (!store) {
 					return null;
 				}
-				let raw;
-				try {
-					raw = store.getItem(storeKey(key));
-				} catch (error) {
-					return null;
+				const saved = readStored(storeKey(key, tag));
+				if (!saved || saved.key !== key) {
+					return null; // nothing, or a different URL with the same hash
 				}
-				if (!raw) {
-					return null;
-				}
-				try {
-					const saved = JSON.parse(raw);
-					if (saved.key !== key) {
-						return null; // a different URL with the same hash
-					}
-					saved.body = undefined;
-					saved.persisted = true;
-					remember(key, saved);
-					return saved;
-				} catch (error) {
-					return null;
-				}
+				saved.body = undefined;
+				saved.persisted = true;
+				remember(key, saved);
+				return saved;
 			}
 
 			function persist(key, entry) {
 				if (!store || entry.text == null) {
 					return;
 				}
+				const headers = {};
+				PERSISTED_HEADERS.forEach((name) => {
+					if (entry.headers && entry.headers[name] !== undefined) {
+						headers[name] = entry.headers[name];
+					}
+				});
 				try {
-					store.setItem(storeKey(key), JSON.stringify({
+					store.setItem(storeKey(key, entry.tag), JSON.stringify({
 						key,
 						tag: entry.tag,
 						status: entry.status,
 						etag: entry.etag,
 						lastModified: entry.lastModified,
-						headers: entry.headers,
+						headers,
+						vary: entry.vary,
 						storedAt: entry.storedAt,
 						expiresAt: entry.expiresAt,
 						staleUntil: entry.staleUntil,
@@ -225,14 +256,25 @@
 				}
 			}
 
-			function forget(key, entry) {
+			function forget(key, entry, tag) {
 				memory.delete(key);
 				if (store && (!entry || entry.persisted)) {
 					try {
-						store.removeItem(storeKey(key));
+						store.removeItem(storeKey(key, entry ? entry.tag : tag));
 					} catch (error) {
 						// Ignored: see persist().
 					}
+				}
+			}
+
+			function storedNames() {
+				if (!store || !isFunction(store.keys)) {
+					return [];
+				}
+				try {
+					return store.keys().filter(name => name.indexOf(prefix) === 0);
+				} catch (error) {
+					return [];
 				}
 			}
 
@@ -265,17 +307,48 @@
 				return { expiresAt, staleUntil };
 			}
 
+			/** The request headers a response says it varies on, with a hash of the value each had. */
+			function varyOf(headers, requestHeader) {
+				const value = headers.vary;
+				if (!value) {
+					return null;
+				}
+				const names = String(value).split(',').map(name => name.trim().toLowerCase()).filter(Boolean);
+				if (names.indexOf('*') !== -1) {
+					return '*';
+				}
+				return names.map(name => ({ name, hash: hashString(String(requestHeader(name) || '')) }));
+			}
+
+			function sameVariant(entry, requestHeader) {
+				if (!entry.vary) {
+					return true;
+				}
+				for (let i = 0; i < entry.vary.length; i++) {
+					if (hashString(String(requestHeader(entry.vary[i].name) || '')) !== entry.vary[i].hash) {
+						return false;
+					}
+				}
+				return true;
+			}
+
 			return {
-				/** @returns {{entry: object, fresh: boolean, usableStale: boolean}|null} */
-				lookup(key) {
+				stamp,
+
+				/**
+				 * `requestHeader(name)` reads a header of the request being made: an entry whose response varied on a
+				 * header that now has another value is not a hit.
+				 * @returns {{entry: object, fresh: boolean, usableStale: boolean}|null}
+				 */
+				lookup(key, tag, requestHeader) {
 					let entry = memory.get(key);
 					if (entry) {
 						memory.delete(key);
 						memory.set(key, entry);
 					} else {
-						entry = hydrate(key);
+						entry = hydrate(key, tag);
 					}
-					if (!entry) {
+					if (!entry || (requestHeader && !sameVariant(entry, requestHeader))) {
 						return null;
 					}
 					const at = now();
@@ -287,14 +360,16 @@
 				},
 
 				/**
-				 * Keeps a 2xx response. Returns the entry, or null when the response may not be cached (no-store) or
-				 * could never be used again (no freshness, no validator, no stale use).
+				 * Keeps a 2xx response. Returns the entry, or null when it may not be cached (no-store, Vary: *) or
+				 * could never be used again (no freshness, no validator, no stale use). The caller checks `stamp()`
+				 * first: an answer to a request that was invalidated while in flight is not stored.
 				 */
-				store(key, tag, policy, response) {
+				store(key, tag, policy, response, requestHeader) {
 					const headers = response.headers;
 					const times = expiry(policy, headers);
-					if (!times) {
-						forget(key);
+					const vary = varyOf(headers, requestHeader || (() => ''));
+					if (!times || vary === '*') {
+						forget(key, memory.get(key), tag);
 						return null;
 					}
 					const etag = policy.etag ? headers.etag || null : null;
@@ -303,12 +378,16 @@
 					if (times.expiresAt === 0 && !validator && times.staleUntil === 0 && !policy.staleIfError) {
 						return null;
 					}
+					// A response that depends on who asked is never written to disk.
+					const personal = Boolean(vary && vary.some(item => CREDENTIAL_HEADER.test(item.name)));
+					const toDisk = Boolean(policy.persist && store && !personal);
 					const entry = {
 						tag,
 						status: response.status,
 						body: response.body,
-						text: policy.persist && store ? response.text : null,
+						text: toDisk ? response.text : null,
 						headers,
+						vary,
 						etag,
 						lastModified,
 						storedAt: now(),
@@ -317,14 +396,16 @@
 						persisted: false
 					};
 					remember(key, entry);
-					if (policy.persist) {
+					if (toDisk) {
 						persist(key, entry);
 						entry.text = null; // the parsed body is what memory keeps
 					}
 					return entry;
 				},
 
-				/** After a 304: the stored copy is current again; take the new freshness from the 304's headers. */
+				/**
+				 * After a 304: the stored copy is current again; take the new freshness from the 304's headers.
+				 */
 				revalidated(key, entry, policy, headers) {
 					const times = expiry(policy, headers);
 					if (!times) {
@@ -341,12 +422,8 @@
 						const parsed = entry.body !== undefined;
 						if (entry.text == null) {
 							// Entries drop their text once parsed; read it back rather than serialise the body again.
-							try {
-								const saved = JSON.parse(store.getItem(storeKey(key)) || 'null');
-								entry.text = saved ? saved.text : null;
-							} catch (error) {
-								entry.text = null;
-							}
+							const saved = readStored(storeKey(key, entry.tag));
+							entry.text = saved ? saved.text : null;
 						}
 						persist(key, entry);
 						if (parsed) {
@@ -369,46 +446,92 @@
 				},
 
 				/**
-				 * Drops entries: all of an endpoint (its method name), those whose key matches a RegExp, those a
-				 * function (entry, key) returns true for, or one exact key. Returns how many were dropped.
+				 * Drops entries, in memory and in the persistent store, and bumps the version that keeps requests
+				 * already in flight for them from being stored when they land: all of a method (its name), one
+				 * request (`baseKey`, with the method's name as `matcher`; every variant of it by scope or varying
+				 * header goes), those whose key matches a RegExp, those a function (entry, key) returns true for.
+				 * Returns how many were dropped.
 				 */
-				invalidate(matcher, exactKey) {
-					if (exactKey) {
-						const entry = memory.get(exactKey) || hydrate(exactKey);
-						if (entry) {
-							forget(exactKey, entry);
-							return 1;
-						}
-						return 0;
-					}
+				invalidate(matcher, baseKey) {
 					let dropped = 0;
+					if (baseKey) {
+						bumpKey(baseKey);
+						const variant = key => key === baseKey || key.indexOf(baseKey + '\n') === 0;
+						Array.from(memory.entries()).forEach((pair) => {
+							if (variant(pair[0])) {
+								forget(pair[0], pair[1]);
+								dropped++;
+							}
+						});
+						const wantedPrefix = tagPrefix(matcher);
+						storedNames().forEach((name) => {
+							if (name.indexOf(wantedPrefix) !== 0) {
+								return;
+							}
+							const saved = readStored(name);
+							if (saved && saved.key && variant(saved.key)) {
+								try {
+									store.removeItem(name);
+									dropped++;
+								} catch (error) {
+									// Ignored: see persist().
+								}
+							}
+						});
+						return dropped;
+					}
+					const byTag = typeof matcher === 'string';
+					if (byTag) {
+						versions.tags.set(matcher, (versions.tags.get(matcher) || 0) + 1);
+					} else {
+						versions.all++; // a pattern cannot be mapped to requests in flight: none of them is stored
+					}
+					const hit = (entry, key) => (byTag ? entry.tag === matcher
+						: matcher instanceof RegExp ? matcher.test(key)
+							: isFunction(matcher) ? Boolean(matcher(entry, key)) : false);
+					const removed = new Set();
 					Array.from(memory.entries()).forEach((pair) => {
-						const key = pair[0];
-						const entry = pair[1];
-						const hit = typeof matcher === 'string' ? entry.tag === matcher
-							: matcher instanceof RegExp ? matcher.test(key)
-								: isFunction(matcher) ? matcher(entry, key) : false;
-						if (hit) {
-							forget(key, entry);
+						if (hit(pair[1], pair[0])) {
+							removed.add(storeKey(pair[0], pair[1].tag));
+							forget(pair[0], pair[1]);
 							dropped++;
+						}
+					});
+					// What a previous launch persisted and this one has not read yet.
+					const wanted = byTag ? tagPrefix(matcher) : null;
+					storedNames().forEach((name) => {
+						if (removed.has(name)) {
+							return;
+						}
+						let match = false;
+						if (byTag) {
+							match = name.indexOf(wanted) === 0;
+						} else {
+							const saved = readStored(name);
+							match = Boolean(saved && saved.key && hit(saved, saved.key));
+						}
+						if (match) {
+							try {
+								store.removeItem(name);
+								dropped++;
+							} catch (error) {
+								// Ignored: see persist().
+							}
 						}
 					});
 					return dropped;
 				},
 
 				clear() {
+					versions.all++;
 					memory.clear();
-					if (store && isFunction(store.keys)) {
+					storedNames().forEach((name) => {
 						try {
-							store.keys().forEach((key) => {
-								if (key.indexOf(prefix) === 0) {
-									store.removeItem(key);
-								}
-							});
+							store.removeItem(name);
 						} catch (error) {
 							// Ignored: see persist().
 						}
-					}
+					});
 				},
 
 				get size() {
@@ -481,6 +604,7 @@
 		const { isFunction, isObject, has, noop, now, getPath, headerKey, hashString, later } = require('./util');
 
 		const EMPTY = Object.freeze({});
+		const ORIGIN = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]+/i;
 		const STALE = { stale: true };
 
 		/**
@@ -610,6 +734,8 @@
 					lead: true,
 					retryPolicy: undefined,
 					cacheKey: null,
+					cacheBase: null,
+					cacheStamp: null,
 					cachePolicy: null,
 					cacheEntry: null,
 					hookRetried: null
@@ -706,7 +832,11 @@
 			function resolveHeaders(ctx) {
 				const out = {};
 				const endpoint = ctx.endpoint;
-				if (endpoint.globalHeaders !== false) {
+				// Default headers (a bearer token, usually) belong to the configured API: a method with a full URL
+				// on another origin gets them only when its definition says `globalHeaders: true`.
+				const wanted = endpoint.globalHeaders !== undefined ? endpoint.globalHeaders
+					: !endpoint.absolute || sameOrigin(ctx.url, state.config.url);
+				if (wanted) {
 					const globals = state.headers;
 					for (let i = 0; i < globals.length; i++) {
 						const value = isFunction(globals[i].value) ? globals[i].value() : globals[i].value;
@@ -725,6 +855,12 @@
 					out[state.idempotency.header] = ctx.idempotencyKey;
 				}
 				return out;
+			}
+
+			function sameOrigin(url, base) {
+				const a = ORIGIN.exec(String(url || ''));
+				const b = ORIGIN.exec(String(base || ''));
+				return Boolean(a && b && a[0].toLowerCase() === b[0].toLowerCase());
 			}
 
 			function mergeHeaders(out, layer) {
@@ -778,12 +914,47 @@
 
 			// ---------------------------------------------------------------- sending
 
+			/** True when the session this request belongs to has ended. */
+			function outdated(ctx) {
+				return ctx.endpoint.session !== false && ctx.generation !== state.generation;
+			}
+
+			function staleError(ctx) {
+				return ResteError('stale', 'RESTe :: the session ended while ' + ctx.endpoint.name + ' was in flight');
+			}
+
+			/**
+			 * A request that cannot be sent (a header function, hook or interceptor threw, the session ended while it
+			 * waited): it fails for its caller and for every identical request that joined it, always on a later
+			 * turn, so a call never throws and never calls back before it returned.
+			 */
+			function abandon(ctx, error) {
+				Promise.resolve().then(() => {
+					if (ctx.shared) {
+						settle(ctx, { error, status: 0, http: null, body: undefined });
+					} else {
+						failed(ctx, error);
+					}
+				});
+			}
+
 			function attempt(ctx) {
 				if (dead(ctx)) {
 					return;
 				}
+				if (outdated(ctx)) {
+					// A retry that was waiting, or a hook's "retry", after the session ended: the next user's
+					// credentials must never be put on the previous user's request.
+					abandon(ctx, staleError(ctx));
+					return;
+				}
 				ctx.attempt++;
-				ctx.headers = resolveHeaders(ctx);
+				try {
+					ctx.headers = resolveHeaders(ctx);
+				} catch (error) {
+					abandon(ctx, toResteError(error));
+					return;
+				}
 				const chain = interceptorsFor(ctx, 'request');
 				if (!chain) {
 					afterInterceptors(ctx);
@@ -811,11 +982,11 @@
 					try {
 						returned = chain[index++](request);
 					} catch (error) {
-						failed(ctx, toResteError(error));
+						abandon(ctx, toResteError(error));
 						return;
 					}
 					if (returned && isFunction(returned.then)) {
-						returned.then(step, error => failed(ctx, toResteError(error)));
+						returned.then(step, error => abandon(ctx, toResteError(error)));
 					} else {
 						step(returned);
 					}
@@ -842,35 +1013,47 @@
 						next();
 						return;
 					}
-					hook(ctx.body === undefined ? {} : ctx.body, (result) => {
-						if (dead(ctx)) {
-							return;
-						}
-						if (result && result.skip) {
-							// Upstream: the hook stopped the call and its value goes to the success callback.
-							deliver(ctx, result, null, true);
-							return;
-						}
-						if (result !== undefined) {
-							ctx.body = result;
-						}
-						next();
-					});
+					try {
+						hook(ctx.body === undefined ? {} : ctx.body, (result) => {
+							if (dead(ctx)) {
+								return;
+							}
+							if (result && result.skip) {
+								// Upstream: the hook stopped the call and its value goes to the success callback.
+								deliver(ctx, result, null, true);
+								return;
+							}
+							if (result !== undefined) {
+								ctx.body = result;
+							}
+							next();
+						});
+					} catch (error) {
+						abandon(ctx, toResteError(error));
+					}
 				};
 				run(beforePost, () => run(beforeSend, () => dispatch(ctx)));
 			}
 
 			function dispatch(ctx) {
-				if (ctx.attempt === 1 || ctx.redispatch) {
-					ctx.redispatch = false;
-					if (ctx.method === 'GET' && !ctx.endpoint.download) {
-						if (lookupCache(ctx)) {
+				try {
+					if (ctx.attempt === 1 || ctx.redispatch) {
+						ctx.redispatch = false;
+						if (ctx.method === 'GET' && !ctx.endpoint.download) {
+							if (lookupCache(ctx)) {
+								return;
+							}
+						}
+						if (joinInflight(ctx)) {
 							return;
 						}
 					}
-					if (joinInflight(ctx)) {
-						return;
+				} catch (error) {
+					if (ctx.settled) {
+						throw error; // the caller's own callback threw while a cached answer was delivered
 					}
+					abandon(ctx, toResteError(error)); // a cache key function that throws
+					return;
 				}
 				transmit(ctx);
 			}
@@ -887,9 +1070,11 @@
 				ctx.cachePolicy = policy;
 				let key;
 				if (isFunction(policy.key)) {
-					key = policy.key(describe(ctx));
+					key = String(policy.key(describe(ctx)));
+					ctx.cacheBase = key;
 				} else {
 					key = 'GET ' + ctx.url;
+					ctx.cacheBase = key;
 					if (policy.vary) {
 						for (let i = 0; i < policy.vary.length; i++) {
 							const name = headerKey(ctx.headers, policy.vary[i]);
@@ -897,11 +1082,17 @@
 						}
 					}
 				}
+				const scope = state.cacheScope;
+				if (scope !== null && scope !== undefined) {
+					key += '\nscope:' + (isFunction(scope) ? scope() : scope);
+				}
 				ctx.cacheKey = key;
+				// Remembered from before the request is sent: an invalidation in the meantime wins over its answer.
+				ctx.cacheStamp = state.cache.stamp(ctx.cacheBase, ctx.endpoint.name);
 				if (options.cache === 'reload' || options.force === true) {
 					return false;
 				}
-				const hit = state.cache.lookup(key);
+				const hit = state.cache.lookup(key, ctx.endpoint.name, name => requestHeader(ctx, name));
 				if (!hit) {
 					return false;
 				}
@@ -926,6 +1117,16 @@
 				return false;
 			}
 
+			/** False when the cache was invalidated for this request after it was sent: its answer is not kept. */
+			function current(ctx) {
+				return ctx.cacheStamp === state.cache.stamp(ctx.cacheBase, ctx.endpoint.name);
+			}
+
+			function requestHeader(ctx, name) {
+				const key = headerKey(ctx.headers, name);
+				return key ? ctx.headers[key] : '';
+			}
+
 			function cachedResponse(ctx, entry, stale) {
 				const response = new Response(ctx, entry.status, null);
 				response.fromCache = true;
@@ -947,6 +1148,12 @@
 				let key = ctx.method + ' ' + ctx.url;
 				for (let i = 0; i < names.length; i++) {
 					key += '\n' + names[i] + ':' + ctx.headers[names[i]];
+				}
+				// A conditional request may be answered 304, which only a caller holding that entry can use; and a
+				// request never joins one of another session.
+				key += '\nif:' + (ctx.cacheEntry ? ctx.cacheEntry.etag || ctx.cacheEntry.lastModified || '' : '');
+				if (endpoint.session !== false) {
+					key += '\nsession:' + ctx.generation;
 				}
 				const shared = state.inflight.get(key);
 				if (shared) {
@@ -977,7 +1184,7 @@
 					if (!typeKey) {
 						headers['Content-Type'] = 'application/x-www-form-urlencoded';
 					}
-					return isObject(body) ? flattenFields(body) : body;
+					return isObject(body) ? flattenFields(body, true) : body;
 				}
 				if (body === undefined) {
 					if (ctx.method === 'DELETE') {
@@ -998,6 +1205,30 @@
 					headers['Content-Type'] = 'application/json';
 				}
 				return JSON.stringify(body);
+			}
+
+			/**
+			 * The URL as it may be printed: sensitive query values replaced, and the values of path placeholders that
+			 * are named like a credential (`<token>`) or that the method lists in `redact`.
+			 */
+			function loggedUrl(ctx) {
+				const log = logger();
+				const endpoint = ctx.endpoint;
+				let url = ctx.url;
+				if (endpoint.secretParams === undefined) {
+					endpoint.secretParams = endpoint.template.names.filter(name => log.sensitive(name) || (endpoint.redact && endpoint.redact.indexOf(name) !== -1));
+				}
+				const params = ctx.params;
+				if (params) {
+					for (let i = 0; i < endpoint.secretParams.length; i++) {
+						const value = params[endpoint.secretParams[i]];
+						if (value !== undefined && value !== null && value !== '') {
+							const text = isObject(value) ? JSON.stringify(value) : String(value);
+							url = url.split(encodeURIComponent(text)).join(log.redacted).split(text).join(log.redacted);
+						}
+					}
+				}
+				return log.redactUrl(url, describe(ctx));
 			}
 
 			function transmit(ctx) {
@@ -1042,6 +1273,11 @@
 					return;
 				}
 
+				if (outdated(ctx)) {
+					// An interceptor or a hook held the request past the end of its session.
+					abandon(ctx, staleError(ctx));
+					return;
+				}
 				ctx.sentSeq = ++state.seq;
 				if (config.failWhenOffline && typeof Ti !== 'undefined' && Ti.Network && Ti.Network.online === false) {
 					// Asked not to wait for a timeout when the device already knows it has no connection.
@@ -1050,7 +1286,7 @@
 				}
 				const log = logger();
 				if (log.enabled) {
-					log.log(method + ' ' + log.redactUrl(ctx.url) + (ctx.attempt > 1 ? ' (attempt ' + ctx.attempt + ')' : ''));
+					log.log(method + ' ' + loggedUrl(ctx) + (ctx.attempt > 1 ? ' (attempt ' + ctx.attempt + ')' : ''));
 					if (log.verbose) {
 						log.log('headers', log.redactHeaders(headers));
 						if (ctx.body !== undefined) {
@@ -1078,6 +1314,7 @@
 					const kind = classifyFailure(event, result.elapsed, ctx.timeout);
 					error = ResteError(kind, kind === 'timeout' ? 'RESTe :: the request timed out' : 'RESTe :: ' + (event.error || 'the request failed'), {
 						cause: event,
+						error: event.error != null ? String(event.error) : undefined,
 						source: result.http,
 						offline: typeof Ti !== 'undefined' && Ti.Network ? Ti.Network.online === false : false,
 						code: event.code !== undefined ? event.code : 0
@@ -1092,7 +1329,7 @@
 					if (policy && !dead(ctx) && shouldRetry(policy, error, ctx.attempt, {
 						method: ctx.method,
 						idempotencyKey: ctx.idempotencyKey,
-						endpointRetry: ctx.endpoint.repeatable || (ctx.options.retry !== undefined && ctx.options.retry !== false),
+						endpointRetry: ctx.endpoint.repeatable,
 						name: ctx.endpoint.name
 					})) {
 						const delay = retryDelay(policy, ctx.attempt, error, state.random);
@@ -1128,6 +1365,7 @@
 					headers,
 					retryAfter: parseRetryAfter(headers['retry-after']),
 					cause: event,
+					error: event.error != null ? String(event.error) : 'HTTP error',
 					source: http,
 					code: result.status
 				});
@@ -1188,7 +1426,9 @@
 				const entry = ctx.cacheEntry;
 				if (entry && (outcome.status === 304
 					|| (outcome.status === 200 && entry.etag && transport.readHeader(http, 'ETag') === entry.etag))) {
-					state.cache.revalidated(ctx.cacheKey, ctx.cacheEntry, ctx.cachePolicy, transport.readHeaders(http));
+					if (current(ctx)) {
+						state.cache.revalidated(ctx.cacheKey, ctx.cacheEntry, ctx.cachePolicy, transport.readHeaders(http));
+					}
 					const cached = cachedResponse(ctx, ctx.cacheEntry, false);
 					cached.notModified = true;
 					cached.http = http;
@@ -1223,13 +1463,13 @@
 					response.body = outcome.body;
 				}
 				shape(ctx, response);
-				if (ctx.cachePolicy && ctx.cacheKey && outcome.status >= 200 && outcome.status < 300) {
+				if (ctx.cachePolicy && ctx.cacheKey && outcome.status >= 200 && outcome.status < 300 && current(ctx)) {
 					state.cache.store(ctx.cacheKey, endpoint.name, ctx.cachePolicy, {
 						status: outcome.status,
 						body: response.body,
 						text: ctx.cachePolicy.persist ? transport.readText(http) : null,
 						headers: response.headers
-					});
+					}, name => requestHeader(ctx, name));
 				}
 				return response;
 			}
@@ -1336,10 +1576,17 @@
 					}
 				};
 				const local = isFunction(endpoint.onLoad) ? value => endpoint.onLoad(value, last, response) : last;
-				if (!skipped && isFunction(config.onLoad)) {
-					config.onLoad(data, local, response);
-				} else {
-					local(data);
+				try {
+					if (!skipped && isFunction(config.onLoad)) {
+						config.onLoad(data, local, response);
+					} else {
+						local(data);
+					}
+				} catch (error) {
+					if (ctx.settled) {
+						throw error; // the caller's own callback: theirs to see, as in 1.x
+					}
+					fail(ctx, decorate(toResteError(error), ctx)); // a hook threw before the call was answered
 				}
 			}
 
@@ -1362,6 +1609,10 @@
 					return;
 				}
 				decorate(error, ctx);
+				if (error.kind === 'stale' || error.kind === 'cancelled') {
+					fail(ctx, error); // nothing to recover, map or announce
+					return;
+				}
 				const policy = ctx.cachePolicy;
 				if (!afterResponse && policy && policy.staleIfError && ctx.cacheEntry
 					&& (error.kind === 'network' || error.kind === 'timeout' || error.status >= 500)) {
@@ -1448,7 +1699,12 @@
 					}
 					const decision = episode.decision;
 					const again = decision === 'retry' || (isObject(decision) && decision.retry === true);
-					if (again && !(ctx.hookRetried && ctx.hookRetried[status]) && ctx.generation === state.generation) {
+					// Sending again is allowed for a request that is safe to repeat, and for any request after a status
+					// that means "refused before anything was done" (401 by default: config.authStatuses).
+					const safe = ctx.method === 'GET' || ctx.method === 'HEAD' || Boolean(ctx.idempotencyKey) || ctx.endpoint.repeatable
+						|| state.authStatuses.indexOf(status) !== -1;
+					// (attempt() refuses a request whose session ended while the hook was working.)
+					if (again && safe && !(ctx.hookRetried && ctx.hookRetried[status])) {
 						(ctx.hookRetried || (ctx.hookRetried = {}))[status] = true;
 						ctx.redispatch = true;
 						ctx.cacheEntry = null;
@@ -1511,7 +1767,10 @@
 				} else if (isFunction(config.onError)) {
 					config.onError(value, retry);
 				} else if (ctx.onLoad) {
-					if (config.errorsToOnLoad) {
+					// 1.x passed an error nobody handles to the success callback. Apps that still ask for 1.x's error
+					// values (`errorsAsObjects: false`) get that too, so a screen written for it does not wait forever.
+					const toOnLoad = config.errorsToOnLoad !== undefined ? config.errorsToOnLoad : config.errorsAsObjects === false;
+					if (toOnLoad) {
 						ctx.onLoad(value, retry);
 					} else {
 						logger().always('unhandled error for ' + endpoint.name + ': ' + error.message
@@ -1535,9 +1794,9 @@
 				if (log.enabled) {
 					const took = (now() - ctx.startedAt) + 'ms';
 					if (error) {
-						log.warn(ctx.method + ' ' + log.redactUrl(ctx.url) + ' failed: ' + (error.status || error.kind) + ' in ' + took);
+						log.warn(ctx.method + ' ' + loggedUrl(ctx) + ' failed: ' + (error.status || error.kind) + ' in ' + took);
 					} else if (response) {
-						log.log(ctx.method + ' ' + log.redactUrl(ctx.url) + ' ' + response.status
+						log.log(ctx.method + ' ' + loggedUrl(ctx) + ' ' + response.status
 							+ (response.fromCache ? (response.notModified ? ' (not modified)' : response.stale ? ' (stale cache)' : ' (cache)') : '') + ' in ' + took);
 					}
 				}
@@ -1657,7 +1916,7 @@
 		 * Fields: status, body (parsed), headers (lower-cased names), url, method, endpoint (the method name),
 		 * retryAfter (ms, from Retry-After), attempts, idempotencyKey, cause (the HTTP client's error event).
 		 * For code written against upstream's `errorsAsObjects: true` the same values are also available under the
-		 * names upstream used: success (false), code, content, error, type, source.
+		 * names upstream used: success (false), code, content, error (the platform's error text), type, source.
 		 */
 		function ResteError(kind, message, details) {
 			const error = new Error(message || kind);
@@ -1683,7 +1942,9 @@
 			// Upstream's `errorsAsObjects` shape.
 			error.success = false;
 			error.type = 'error';
-			error.error = error.message;
+			if (error.error === undefined) {
+				error.error = error.message; // HTTP and network errors keep the platform's text here, as in 1.x
+			}
 			if (error.code === undefined) {
 				error.code = error.status;
 			}
@@ -1862,6 +2123,87 @@
 
 		module.exports = { createKeys };
 	},
+	"./identity": function (module, exports, require) {
+		/**
+		 * One model instance per id.
+		 *
+		 * Where the JavaScript engine has WeakRef the map holds its models weakly: a model stays as long as anything
+		 * else holds it (a collection, a screen), and is forgotten when nothing does. Without WeakRef it holds them
+		 * strongly and, past `limit`, drops the oldest ones that no collection holds (`held(model)`).
+		 *
+		 * options: { weak (default: when available), limit (default 1000), held(model) -> boolean }
+		 */
+		function createIdentityMap(options) {
+			const settings = options || {};
+			const weak = settings.weak !== false && typeof WeakRef === 'function';
+			const limit = settings.limit > 0 ? settings.limit : 1000;
+			const held = settings.held || (() => false);
+			const map = new Map(); // id -> model, or a WeakRef to it
+			let writes = 0;
+
+			function read(id) {
+				const value = map.get(id);
+				if (value === undefined) {
+					return undefined;
+				}
+				if (!weak) {
+					return value;
+				}
+				const model = value.deref();
+				if (model === undefined) {
+					map.delete(id);
+				}
+				return model;
+			}
+
+			/** Weak mode: forget the ids whose model is gone. */
+			function sweep() {
+				map.forEach((value, id) => {
+					if (value.deref() === undefined) {
+						map.delete(id);
+					}
+				});
+			}
+
+			/** Strong mode: back under the limit by dropping the oldest models that no collection holds. */
+			function trim() {
+				const ids = Array.from(map.keys());
+				for (let i = 0; i < ids.length && map.size > limit; i++) {
+					if (!held(map.get(ids[i]))) {
+						map.delete(ids[i]);
+					}
+				}
+			}
+
+			return {
+				weak,
+				get: read,
+				has: id => read(id) !== undefined,
+				set(id, model) {
+					map.delete(id);
+					map.set(id, weak ? new WeakRef(model) : model);
+					writes++;
+					if (weak) {
+						if (writes % 512 === 0) {
+							sweep();
+						}
+					} else if (map.size > limit) {
+						trim();
+					}
+				},
+				delete: id => map.delete(id),
+				clear: () => map.clear(),
+				get size() {
+					if (weak) {
+						sweep();
+					}
+					return map.size;
+				}
+			};
+		}
+
+		module.exports = { createIdentityMap };
+	},
 	"./index": function (module, exports, require) {
 		const { ResteError } = require('./errors');
 		const { compileTemplate, isAbsolute, fillTemplate, joinUrl, serializeQuery, withQuery, DEFAULT_QUERY_OPTIONS } = require('./url');
@@ -1886,6 +2228,9 @@
 
 		const VERBS = ['post', 'get', 'put', 'patch', 'delete', 'head']; // upstream's order: the last one defined wins
 
+		/** How many compiled URLs a method whose URL is a function keeps. */
+		const MAX_VARIANTS = 32;
+
 		function Reste() {
 			if (!(this instanceof Reste)) {
 				return new Reste();
@@ -1900,6 +2245,8 @@
 				idempotency: { header: 'Idempotency-Key', methods: [] },
 				retry: null,
 				cacheDefaults: null,
+				cacheScope: null,
+				authStatuses: [401],
 				pagination: null,
 				cache: createCache({}),
 				keys: createKeys(uuid),
@@ -1985,6 +2332,7 @@
 					session: def.session,
 					statusHooks: def.statusHooks,
 					interceptors: def.interceptors || null,
+					redact: def.redact ? [].concat(def.redact) : null,
 					clientOptions: def.clientOptions,
 					securityManager: def.securityManager
 				};
@@ -2004,12 +2352,17 @@
 					return endpoint;
 				}
 				const source = String(endpoint.dynamic());
-				const cache = record.variants || (record.variants = Object.create(null));
-				if (!cache[source]) {
-					cache[source] = compile(record.def, source);
-					cache[source].dynamic = null;
+				let cache = record.variants || (record.variants = new Map());
+				let variant = cache.get(source);
+				if (!variant) {
+					if (cache.size >= MAX_VARIANTS) {
+						cache = record.variants = new Map(); // a URL that keeps changing must not grow this forever
+					}
+					variant = compile(record.def, source);
+					variant.dynamic = null;
+					cache.set(source, variant);
 				}
-				return cache[source];
+				return variant;
 			}
 
 			function invoke(record, params, a, b, c) {
@@ -2114,6 +2467,8 @@
 				const cache = isObject(config.cache) ? config.cache : {};
 				state.cacheDefaults = normalizeCachePolicy(isObject(cache.defaults) ? cache.defaults : true, null);
 				state.cache = createCache({ maxEntries: cache.maxEntries, store: cache.store, prefix: cache.prefix });
+				state.cacheScope = cache.scope === undefined ? null : cache.scope;
+				state.authStatuses = Array.isArray(config.authStatuses) ? config.authStatuses.map(Number) : [401];
 
 				state.interceptors = { request: [], response: [], error: [] };
 				if (config.interceptors) {
@@ -2322,9 +2677,10 @@
 						url = endpoint.absolute ? url : joinUrl(state.config.url, url);
 						const query = Object.assign({}, endpoint.query, params && isObject(params.query) && !endpoint.queryIsParam ? params.query : null);
 						if (Object.keys(query).length) {
-							url = withQuery(url, serializeQuery(query, state.queryOptions));
+							url = withQuery(url, isFunction(state.config.querySerializer) ? state.config.querySerializer(query)
+								: serializeQuery(query, state.queryOptions));
 						}
-						return state.cache.invalidate(null, 'GET ' + url);
+						return state.cache.invalidate(matcher, 'GET ' + url);
 					}
 					return state.cache.invalidate(matcher);
 				},
@@ -2389,6 +2745,17 @@
 				return data.liveList(options);
 			};
 
+			/** Numbers for finding leaks: what is in flight, cached and kept per method and per model. */
+			reste.inspect = function () {
+				const variants = {};
+				records.forEach((record, name) => {
+					if (record.variants) {
+						variants[name] = record.variants.size;
+					}
+				});
+				return { inFlight: state.active.size, shared: state.inflight.size, cache: state.cache.size, variants, identity: data.identity.sizes() };
+			};
+
 			reste.collections = data.collections;
 			reste.models = state.models;
 			reste.identity = data.identity;
@@ -2435,7 +2802,8 @@
 		 *
 		 * Cursor pagination adds loadOlder() (= loadMore) and loadNewer().
 		 *
-		 * deps: { Events, collection, pagination, content, request(query, signal) -> handle, merge(items) -> result }
+		 * deps: { Events, collection, pagination, content, request(params, query, signal) -> handle,
+		 *         merge(items) -> result, track(promise) }
 		 */
 		function createLiveList(deps, options) {
 			const collection = deps.collection;
@@ -2640,6 +3008,9 @@
 			function settle(promise, how, more) {
 				const mine = generation;
 				failedMore = false;
+				if (deps.track) {
+					deps.track(promise); // optimistic writes stay protected until this load has landed
+				}
 				return promise.then((page) => {
 					if (destroyed || mine !== generation || page.discarded) {
 						return page;
@@ -2787,29 +3158,28 @@
 
 		const REDACTED = '[redacted]';
 
-		const DEFAULT_REDACTED_HEADERS = [
-			'authorization', 'proxy-authorization', 'cookie', 'set-cookie', 'x-api-key', 'x-auth-token', 'x-csrf-token',
-			'x-xsrf-token'
-		];
+		/**
+		 * A name is treated as a credential when, written without case and punctuation, it contains one of these...
+		 * (`X-Access-Token`, `accessToken`, `access_token`, `refreshToken`, `X-Amz-Signature`, `client_secret`)
+		 */
+		const SENSITIVE_PARTS = ['token', 'secret', 'password', 'passwd', 'passphrase', 'signature', 'credential', 'authorization',
+			'cookie', 'apikey', 'privatekey', 'sessionid', 'otp', 'cvv', 'cvc', 'cardnumber'];
 
-		const DEFAULT_REDACTED_KEYS = [
-			'password', 'password_confirmation', 'current_password', 'new_password', 'token', 'access_token',
-			'refresh_token', 'id_token', 'secret', 'client_secret', 'api_key', 'apikey', 'authorization', 'otp', 'card_number',
-			'cvc', 'cvv'
-		];
+		/** ... or is one of these, or ends in "key" (`key`, `api_key`, `X-Api-Key`; not `keyword`). */
+		const SENSITIVE_NAMES = ['key', 'sig', 'pin', 'pwd', 'auth', 'jwt', 'sid', 'ssn', 'code'];
 
-		function toSet(defaults, extra) {
-			const set = Object.create(null);
-			defaults.concat(extra || []).forEach((name) => {
-				set[String(name).toLowerCase()] = true;
-			});
-			return set;
+		function normalize(name) {
+			return String(name).toLowerCase().replace(/[^a-z0-9]/g, '');
 		}
 
 		/**
-		 * The debug logger. Off unless `config.debug` is set, and then it never prints a credential: header values
-		 * named in `redact.headers` (Authorization, cookies and API keys by default) and body or query values whose
-		 * key is in `redact.keys` (passwords, tokens, codes by default) are replaced by "[redacted]".
+		 * The debug logger. Off unless `config.debug` is set, and then it replaces by "[redacted]" every value whose
+		 * *name* looks like a credential: request headers, fields of JSON and form bodies (also when the body is a
+		 * string), query parameters, and path values whose placeholder is named like one or that the method lists in
+		 * `redact`. `config.redact` adds names ({ headers, keys }) and a function for the URL ({ url }).
+		 *
+		 * It cannot recognise a secret under an innocent name, in free text, or in a path segment it was not told
+		 * about. Response headers and bodies are never printed.
 		 *
 		 * `config.logger(level, message, details)` replaces console output; `debug: 'verbose'` adds headers and bodies.
 		 */
@@ -2818,15 +3188,36 @@
 			const verbose = config.debug === 'verbose';
 			const sink = isFunction(config.logger) ? config.logger : null;
 			const redact = config.redact || {};
-			const headerNames = toSet(DEFAULT_REDACTED_HEADERS, redact.headers);
-			const keyNames = toSet(DEFAULT_REDACTED_KEYS, redact.keys);
+			const extra = [].concat(redact.headers || [], redact.keys || []).map(normalize).filter(Boolean);
+			const urlHook = isFunction(redact.url) ? redact.url : null;
+
+			function sensitive(name) {
+				const plain = normalize(name);
+				if (!plain) {
+					return false;
+				}
+				if (SENSITIVE_NAMES.indexOf(plain) !== -1 || (plain.length > 3 && plain.slice(-3) === 'key')) {
+					return true;
+				}
+				for (let i = 0; i < SENSITIVE_PARTS.length; i++) {
+					if (plain.indexOf(SENSITIVE_PARTS[i]) !== -1) {
+						return true;
+					}
+				}
+				for (let i = 0; i < extra.length; i++) {
+					if (plain.indexOf(extra[i]) !== -1) {
+						return true;
+					}
+				}
+				return false;
+			}
 
 			function redactHeaders(headers) {
 				const out = {};
 				if (headers) {
 					const keys = Object.keys(headers);
 					for (let i = 0; i < keys.length; i++) {
-						out[keys[i]] = headerNames[keys[i].toLowerCase()] ? REDACTED : headers[keys[i]];
+						out[keys[i]] = sensitive(keys[i]) ? REDACTED : headers[keys[i]];
 					}
 				}
 				return out;
@@ -2836,7 +3227,7 @@
 				if (isBinary(value)) {
 					return '[binary]';
 				}
-				if (!isObject(value) || depth > 6) {
+				if (!isObject(value) || depth > 8) {
 					return value;
 				}
 				if (Array.isArray(value)) {
@@ -2845,31 +3236,65 @@
 				const out = {};
 				const keys = Object.keys(value);
 				for (let i = 0; i < keys.length; i++) {
-					out[keys[i]] = keyNames[keys[i].toLowerCase()] ? REDACTED : redactValue(value[keys[i]], depth + 1);
+					out[keys[i]] = sensitive(keys[i]) ? REDACTED : redactValue(value[keys[i]], depth + 1);
 				}
 				return out;
 			}
 
-			/** Replaces the values of sensitive query parameters in a URL. */
-			function redactUrl(url) {
-				const mark = url.indexOf('?');
-				if (mark === -1) {
-					return url;
-				}
-				const pairs = url.slice(mark + 1).split('&').map((pair) => {
+			/** `a=1&password=x` with the values of sensitive names replaced. Names like `user[token]` count as `token`. */
+			function redactPairs(text) {
+				return text.split('&').map((pair) => {
 					const equals = pair.indexOf('=');
 					if (equals === -1) {
 						return pair;
 					}
-					let key = pair.slice(0, equals);
+					let name = pair.slice(0, equals);
 					try {
-						key = decodeURIComponent(key);
+						name = decodeURIComponent(name.replace(/\+/g, ' '));
 					} catch (error) {
-						// Keep the raw key.
+						// Keep the raw name.
 					}
-					return keyNames[key.replace(/\[.*$/, '').toLowerCase()] ? pair.slice(0, equals + 1) + REDACTED : pair;
-				});
-				return url.slice(0, mark + 1) + pairs.join('&');
+					const parts = name.split(/[[\]]+/).filter(Boolean);
+					return parts.some(sensitive) ? pair.slice(0, equals + 1) + REDACTED : pair;
+				}).join('&');
+			}
+
+			/** A body as it may be printed. Strings are read as JSON or as a form; anything else is not printed. */
+			function redactBody(body) {
+				if (typeof body !== 'string') {
+					return redactValue(body, 0);
+				}
+				const text = body.trim();
+				if (text.charAt(0) === '{' || text.charAt(0) === '[') {
+					try {
+						return JSON.stringify(redactValue(JSON.parse(text), 0));
+					} catch (error) {
+						// Not JSON after all.
+					}
+				}
+				if (/^[^=&\s<>{}]+=[^&\s]*(&[^=&\s<>{}]+=[^&\s]*)*$/.test(text)) {
+					return redactPairs(text);
+				}
+				return '[text, ' + body.length + ' characters]';
+			}
+
+			/** Replaces the values of sensitive query parameters in a URL, then applies `redact.url`. */
+			function redactUrl(url, request) {
+				let out = String(url);
+				const mark = out.indexOf('?');
+				if (mark !== -1) {
+					const hash = out.indexOf('#', mark);
+					const query = hash === -1 ? out.slice(mark + 1) : out.slice(mark + 1, hash);
+					out = out.slice(0, mark + 1) + redactPairs(query) + (hash === -1 ? '' : out.slice(hash));
+				}
+				if (urlHook) {
+					try {
+						out = String(urlHook(out, request));
+					} catch (error) {
+						out = '[url]';
+					}
+				}
+				return out;
 			}
 
 			function write(level, message, details) {
@@ -2888,9 +3313,11 @@
 			return {
 				enabled,
 				verbose,
+				sensitive,
 				redactHeaders,
 				redactUrl,
-				redactBody: value => redactValue(value, 0),
+				redactBody,
+				redacted: REDACTED,
 				log(message, details) {
 					if (enabled) {
 						write('info', message, details);
@@ -2924,13 +3351,17 @@
 
 		/**
 		 * The attributes of `incoming` that differ from `current`, or null when none do. Keys `incoming` lacks are
-		 * left alone: a list row usually carries fewer fields than the detail of the same resource.
+		 * left alone: a list row usually carries fewer fields than the detail of the same resource. `pending` names
+		 * attributes to leave alone as well (optimistic changes in flight).
 		 */
-		function diffAttributes(current, incoming) {
+		function diffAttributes(current, incoming, pending) {
 			let diff = null;
 			const keys = Object.keys(incoming);
 			for (let i = 0; i < keys.length; i++) {
 				const key = keys[i];
+				if (pending && pending[key] > 0) {
+					continue; // changed on the device, not answered by the server yet: the device's value stands
+				}
 				const a = current[key];
 				const b = incoming[key];
 				if (a === b) {
@@ -2986,7 +3417,9 @@
 			function upsert(collection, items, settings) {
 				const Model = settings.Model || collection.model;
 				const idAttribute = settings.idAttribute || 'id';
-				const mirror = settings.mirrorId && idAttribute !== 'id';
+				const sourceId = settings.sourceId || idAttribute;
+				const mirror = Boolean(settings.mirrorId) && sourceId !== idAttribute;
+				const destroying = settings.destroying && settings.destroying.size ? settings.destroying : null;
 				const identity = settings.identity || null;
 				const replace = settings.mode === 'replace';
 				const coalesce = settings.events !== 'each';
@@ -3045,12 +3478,15 @@
 									model = attrs;
 								}
 							} else {
-								if (mirror && attrs.id === undefined && attrs[idAttribute] !== undefined) {
-									attrs = Object.assign({ id: attrs[idAttribute] }, attrs);
+								if (mirror && attrs.id === undefined && attrs[sourceId] != null) {
+									attrs = Object.assign({ id: attrs[sourceId] }, attrs);
+								}
+								if (destroying && destroying.has(attrs[idAttribute])) {
+									continue; // being deleted on the device: this response was asked for before that
 								}
 								model = find(attrs[idAttribute]);
 								if (model) {
-									const diff = diffAttributes(model.attributes, attrs);
+									const diff = diffAttributes(model.attributes, attrs, model._pendingAttrs);
 									if (diff) {
 										model.set(diff);
 										job.changed.push(model);
@@ -3094,14 +3530,24 @@
 				function settleReplace() {
 					const desired = [];
 					const wanted = new Set();
+					const gone = settings.destroying && settings.destroying.size ? settings.destroying : null;
 					job.models.forEach((model) => {
-						if (!wanted.has(model)) {
+						// (A model whose optimistic destroy began while this merge was running stays out.)
+						if (!wanted.has(model) && !(gone && gone.has(model.id))) {
 							wanted.add(model);
 							desired.push(model);
 						}
 					});
-					job.models = desired;
+					job.models = desired.slice();
 					const current = collection.models;
+					// A model that was created on the device and is still being sent is not in the server's list
+					// yet: it keeps its place.
+					current.forEach((model, index) => {
+						if (model._pendingCreate && !wanted.has(model)) {
+							wanted.add(model);
+							desired.splice(Math.min(index, desired.length), 0, model);
+						}
+					});
 					const had = new Set(current);
 					job.removed = current.filter(model => !wanted.has(model));
 					job.added = desired.filter(model => !had.has(model));
@@ -3680,8 +4126,11 @@
 		const { ResteError } = require('./errors');
 		const { createMerger, diffAttributes, isCoalesced, touch } = require('./merge');
 		const { createLiveList } = require('./list');
+		const { createIdentityMap } = require('./identity');
 		const { normalizePagination, createPager, readPage } = require('./pagination');
 		const { isFunction, isObject, isPlainObject, has, noop, getPath, deepEqual, hashString } = require('./util');
+
+		const notAborted = () => false;
 
 		/** Options of fetch / save / destroy that are passed on to the request. */
 		const CALL_OPTIONS = ['headers', 'timeout', 'signal', 'retry', 'cache', 'force', 'dedupe', 'deadline', 'idempotencyKey',
@@ -3696,8 +4145,41 @@
 		function createData(reste, state) {
 			const batch = { depth: 0, dirty: new Map() };
 			const merger = createMerger(batch);
-			const records = Object.create(null); // model name -> { config, Model, idAttribute, mirrorId, identity }
+			const records = Object.create(null); // model name -> { config, Model, idAttribute, sourceId, mirrorId, identity, ... }
 			const collections = Object.create(null); // collection name -> collection
+
+			// List loads in flight. An optimistic write keeps its protection until every load that was asked for
+			// before the server answered the write has landed: such a load may still carry the old state.
+			const activeLoads = new Set();
+			let loadWaiters = [];
+
+			function trackLoad(promise) {
+				const token = {};
+				activeLoads.add(token);
+				const landed = () => {
+					activeLoads.delete(token);
+					const ready = [];
+					loadWaiters = loadWaiters.filter((waiter) => {
+						waiter.pending.delete(token);
+						if (waiter.pending.size === 0) {
+							ready.push(waiter.run);
+							return false;
+						}
+						return true;
+					});
+					ready.forEach(run => run());
+				};
+				promise.then(landed, landed);
+				return promise;
+			}
+
+			function whenLoadsLanded(run) {
+				if (activeLoads.size === 0) {
+					run();
+				} else {
+					loadWaiters.push({ pending: new Set(activeLoads), run });
+				}
+			}
 
 			function backbone() {
 				const found = state.config.Backbone
@@ -3731,7 +4213,7 @@
 			/** A promise that carries the request's abort(), and never reports "unhandled" for Backbone-style callers. */
 			function derive(handle, onFulfilled, onRejected) {
 				const result = handle.then(onFulfilled, onRejected);
-				result.abort = result.cancel = handle.abort || noop;
+				result.abort = result.cancel = handle.abort || notAborted;
 				result.idempotencyKey = handle.idempotencyKey || null;
 				result.catch(noop);
 				return result;
@@ -3740,7 +4222,7 @@
 			function rejected(error, options, target) {
 				const handle = Promise.reject(error);
 				handle.catch(noop);
-				handle.abort = handle.cancel = noop;
+				handle.abort = handle.cancel = notAborted;
 				Promise.resolve().then(() => {
 					if (options && isFunction(options.error)) {
 						options.error(error);
@@ -3751,9 +4233,13 @@
 				return handle;
 			}
 
+			/**
+			 * 1.x kept Backbone's id in `id` and copied the configured attribute (`objectId`, say) into it for
+			 * everything the server sent. Attributes that only have the configured one get `id` here.
+			 */
 			function mirrored(record, attrs) {
-				if (record.mirrorId && isPlainObject(attrs) && attrs.id === undefined && attrs[record.idAttribute] !== undefined) {
-					return Object.assign({ id: attrs[record.idAttribute] }, attrs);
+				if (record.mirrorId && isPlainObject(attrs) && attrs.id === undefined && attrs[record.sourceId] != null) {
+					return Object.assign({ id: attrs[record.sourceId] }, attrs);
 				}
 				return attrs;
 			}
@@ -3781,7 +4267,7 @@
 				if (record.mirrorId) {
 					delete body.id;
 				}
-				delete body[record.idAttribute];
+				delete body[record.sourceId];
 				return body;
 			}
 
@@ -3791,7 +4277,7 @@
 				const params = {};
 				let methodName;
 				if (model.id != null) {
-					params[record.idAttribute] = model.id;
+					params[record.sourceId] = model.id;
 					params.id = model.id;
 				}
 				if (method === 'create' && model.id != null) {
@@ -3928,8 +4414,10 @@
 					previous[name] = model.has(name) ? model.get(name) : undefined;
 				});
 				const userError = settings.error;
+				let release = noop;
 				settings.error = function (target, error) {
 					const failure = error === undefined ? target : error;
+					release();
 					const restore = {};
 					const drop = [];
 					Object.keys(attrs).forEach((name) => {
@@ -3952,7 +4440,35 @@
 						model.trigger('error', model, failure, settings); // 0.9.2 only fires "error" without a callback
 					}
 				};
-				return Base.prototype.save.call(model, attrs, settings);
+				const request = Base.prototype.save.call(model, attrs, settings);
+				if (request && isFunction(request.then)) {
+					release = holdAttributes(model, Object.keys(attrs));
+					request.then(() => whenLoadsLanded(release), release);
+				}
+				return request;
+			}
+
+			/**
+			 * Marks attributes as changed on the device and not yet answered by the server: a list response that was
+			 * requested before the change must not put the old values back. Returns the function that lifts the mark.
+			 */
+			function holdAttributes(model, names) {
+				const pending = model._pendingAttrs || (model._pendingAttrs = {});
+				names.forEach((name) => {
+					pending[name] = (pending[name] || 0) + 1;
+				});
+				let released = false;
+				return function () {
+					if (released) {
+						return;
+					}
+					released = true;
+					names.forEach((name) => {
+						if (--pending[name] <= 0) {
+							delete pending[name];
+						}
+					});
+				};
 			}
 
 			function optimisticChange(model, changes, send) {
@@ -3961,7 +4477,9 @@
 					previous[name] = model.has(name) ? model.get(name) : undefined;
 				});
 				model.set(changes);
+				const release = holdAttributes(model, Object.keys(changes));
 				const result = Promise.resolve().then(send).then((resource) => {
+					whenLoadsLanded(release);
 					if (isPlainObject(resource)) {
 						const diff = diffAttributes(model.attributes, resource);
 						if (diff) {
@@ -3971,6 +4489,7 @@
 					}
 					return model;
 				}, (error) => {
+					release();
 					Object.keys(changes).forEach((name) => {
 						if (deepEqual(model.get(name), changes[name])) {
 							if (previous[name] === undefined) {
@@ -3995,14 +4514,17 @@
 			function optimisticAdd(meta, collection, attributes, send, options) {
 				const record = meta.record;
 				const model = new record.Model(mirrored(record, attributes));
+				model._pendingCreate = true; // a refresh that lands meanwhile must not drop it
 				collection.add(model, options);
 				meta.mutations++;
 				return Promise.resolve().then(send).then((resource) => {
 					if (isPlainObject(resource)) {
 						return settleCreated(meta, collection, model, mirrored(record, resource));
 					}
+					model._pendingCreate = false;
 					return model;
 				}, (error) => {
+					model._pendingCreate = false;
 					collection.remove(model);
 					model.trigger('rollback', model, error, {});
 					throw error;
@@ -4013,6 +4535,9 @@
 			function settleCreated(meta, collection, model, resource) {
 				const record = meta.record;
 				const id = resource[record.idAttribute];
+				whenLoadsLanded(() => {
+					model._pendingCreate = false;
+				});
 				const existing = id != null && id !== model.id ? collection.get(id) || (record.identity ? record.identity.get(id) : null) : null;
 				if (existing && existing !== model) {
 					collection.remove(model);
@@ -4053,8 +4578,24 @@
 					}
 				});
 				const userError = settings.error;
+				const id = model.id;
+				// Until the server has answered, a list response that still contains the model must not re-add it.
+				if (record) {
+					record.destroying.set(id, (record.destroying.get(id) || 0) + 1);
+				}
+				const settled = () => {
+					if (record) {
+						const left = (record.destroying.get(id) || 1) - 1;
+						if (left > 0) {
+							record.destroying.set(id, left);
+						} else {
+							record.destroying.delete(id);
+						}
+					}
+				};
 				settings.error = function (target, error) {
 					const failure = error === undefined ? target : error;
+					settled();
 					places.forEach((place) => {
 						if (place.collection.indexOf(model) === -1) {
 							place.collection.add(model, { at: Math.min(place.index, place.collection.length) });
@@ -4070,24 +4611,63 @@
 						model.trigger('error', model, failure, settings);
 					}
 				};
-				return Base.prototype.destroy.call(model, settings);
+				const request = Base.prototype.destroy.call(model, settings);
+				if (request && isFunction(request.then)) {
+					request.then(() => whenLoadsLanded(settled), noop);
+				} else {
+					settled();
+				}
+				return request;
 			}
 
 			function addModel(args) {
 				const BB = backbone();
 				reste.modelConfig = reste.modelConfig || {};
 				reste.modelConfig[args.name] = args;
-				const idAttribute = args.id || 'id';
+				// 1.x: Backbone's id is `id`, and the attribute named in the config is copied into it. With
+				// `mirrorId: false` the configured attribute is Backbone's id and nothing is copied.
+				const sourceId = args.id || 'id';
+				const mirrorId = sourceId !== 'id' && args.mirrorId !== false;
+				const identityOption = args.identity !== undefined ? args.identity : state.config.identity;
 				const record = {
 					config: args,
-					idAttribute,
-					mirrorId: idAttribute !== 'id' && args.mirrorId !== false,
-					identity: (args.identity !== undefined ? args.identity : state.config.identity) ? new Map() : null,
+					sourceId,
+					idAttribute: mirrorId ? 'id' : sourceId,
+					mirrorId,
+					identity: null,
+					lists: [], // the collections of this model
+					destroying: new Map(), // id -> optimistic destroys the server has not answered yet
 					Model: null
 				};
+				if (identityOption) {
+					record.identity = createIdentityMap({
+						weak: isObject(identityOption) ? identityOption.weak : undefined,
+						limit: isObject(identityOption) ? identityOption.limit : undefined,
+						held: model => record.lists.some(list => (model.id != null ? list.get(model.id) === model : false))
+					});
+				}
 				const Base = BB.Model;
+				const baseSet = Base.prototype.set;
 				record.Model = Base.extend({
-					idAttribute,
+					idAttribute: record.idAttribute,
+					set(key, value, options) {
+						if (!mirrorId || key == null) {
+							return baseSet.call(this, key, value, options);
+						}
+						// However the attributes arrive (the constructor, collection.add, a merge), the configured
+						// id attribute also sets `id`.
+						let attrs = key;
+						let settings = value;
+						if (typeof key !== 'object') {
+							attrs = {};
+							attrs[key] = value;
+							settings = options;
+						}
+						if (attrs.id === undefined && attrs[sourceId] != null && !(settings && settings.unset)) {
+							attrs = Object.assign({ id: attrs[sourceId] }, attrs);
+						}
+						return baseSet.call(this, attrs, settings);
+					},
 					_type: args.name,
 					_method: args.name,
 					sync(method, model, options) {
@@ -4173,7 +4753,7 @@
 					throw new Error('RESTe :: unknown model ' + name);
 				}
 				const attrs = {};
-				attrs[record.idAttribute] = id;
+				attrs[record.sourceId] = id;
 				return createModel(name, attrs);
 			}
 
@@ -4213,6 +4793,9 @@
 					app.Collections[config.name] = collection;
 				}
 				collections[config.name] = collection;
+				if (record.lists.indexOf(collection) === -1) {
+					record.lists.push(collection);
+				}
 
 				const Base = BB.Collection.prototype;
 				const meta = {
@@ -4280,7 +4863,7 @@
 				};
 
 				collection.hasMore = function () {
-					return meta.pager ? meta.pager.hasMore : false;
+					return meta.pager && meta.pager.loaded ? meta.pager.hasMore : false;
 				};
 
 				/** Merges items (from a socket, a push payload, another response) into the collection. */
@@ -4308,6 +4891,7 @@
 					settings.error = function (target, error) {
 						const failure = error === undefined ? target : error;
 						if (created) {
+							created._pendingCreate = false;
 							self.remove(created);
 							created.trigger('rollback', created, failure, settings);
 						}
@@ -4331,7 +4915,20 @@
 						}
 					};
 					delete settings.optimistic; // the model's own save must not try to roll attributes back
+					const userDone = settings.success;
+					settings.success = function () {
+						const model = created;
+						if (model) {
+							whenLoadsLanded(() => {
+								model._pendingCreate = false;
+							});
+						}
+						return userDone.apply(this, arguments);
+					};
 					created = Base.create.call(this, attributes, settings);
+					if (created) {
+						created._pendingCreate = created.isNew(); // a refresh that lands before the answer keeps it
+					}
 					return created;
 				};
 
@@ -4349,8 +4946,10 @@
 				return {
 					Model: record.Model,
 					idAttribute: record.idAttribute,
+					sourceId: record.sourceId,
 					mirrorId: record.mirrorId,
 					identity: record.identity,
+					destroying: record.destroying,
 					mode,
 					position,
 					chunk: settings.chunk !== undefined ? settings.chunk : (config.chunk !== undefined ? config.chunk : state.config.chunk),
@@ -4482,8 +5081,8 @@
 					throw error;
 				};
 				const finished = (promise, abortRequest) => {
-					const result = promise.then(null, fail);
-					result.abort = result.cancel = abortRequest || noop;
+					const result = trackLoad(promise).then(null, fail);
+					result.abort = result.cancel = abortRequest || notAborted;
 					result.catch(noop);
 					return result;
 				};
@@ -4623,6 +5222,7 @@
 					collection,
 					pagination,
 					content: settings.content !== undefined ? settings.content : meta.config.content,
+					track: trackLoad,
 					request(params, query, signal) {
 						const all = Object.assign({}, meta.config.params, isFunction(params) ? params() : params);
 						const merged = Object.assign({}, meta.config.query, isFunction(query) ? query() : query);
@@ -4646,7 +5246,15 @@
 				});
 				Object.keys(collections).forEach((name) => {
 					const collection = collections[name];
-					if (collection.paging !== undefined) {
+					const meta = collection._reste;
+					if (meta) {
+						// The next session starts from the first page, and nothing is "unchanged since last time".
+						if (meta.pager) {
+							meta.pager.reset();
+						}
+						meta.cleanAt = -1;
+						meta.lastUrl = meta.lastEtag = meta.lastHash = null;
+						meta.lastLength = -1;
 						collection.meta = null;
 						collection.paging = null;
 					}
@@ -4682,6 +5290,20 @@
 								records[key].identity.clear();
 							}
 						});
+					},
+					/** How many models the identity map of a model holds. */
+					size(name) {
+						const record = records[name];
+						return record && record.identity ? record.identity.size : 0;
+					},
+					sizes() {
+						const out = {};
+						Object.keys(records).forEach((key) => {
+							if (records[key].identity) {
+								out[key] = records[key].identity.size;
+							}
+						});
+						return out;
 					}
 				}
 			};
@@ -4885,25 +5507,24 @@
 		function compileTemplate(source) {
 			const literals = [];
 			const names = [];
+			const inQuery = []; // per placeholder: it sits after the "?" (an empty value is fine there)
 			let last = 0;
 			let match;
 			PLACEHOLDER.lastIndex = 0;
 			while ((match = PLACEHOLDER.exec(source)) !== null) {
 				literals.push(source.slice(last, match.index));
 				names.push(match[1]);
+				inQuery.push(source.lastIndexOf('?', match.index) !== -1);
 				last = match.index + match[0].length;
 			}
 			literals.push(source.slice(last));
-			return { source, literals, names };
-		}
-
-		function isMissing(value) {
-			return value === null || value === undefined || value === '';
+			return { source, literals, names, inQuery };
 		}
 
 		/**
 		 * Fills a compiled template. Objects are sent as JSON, as upstream did. Throws a ResteError('params') naming
-		 * every placeholder that has no value.
+		 * every placeholder that has no value: null and undefined anywhere, and an empty string in the path (where
+		 * it would turn `things/<id>` into the URL of the whole list), but not in the query string.
 		 */
 		function fillTemplate(template, params, encode, endpointName) {
 			const names = template.names;
@@ -4915,7 +5536,7 @@
 			let missing = null;
 			for (let i = 0; i < names.length; i++) {
 				let value = params ? params[names[i]] : undefined;
-				if (isMissing(value)) {
+				if (value === null || value === undefined || (value === '' && !template.inQuery[i])) {
 					(missing || (missing = [])).push(names[i]);
 				} else {
 					if (isObject(value)) {
@@ -5048,16 +5669,22 @@
 		 * Flattens a body for multipart or form encoding, because Titanium's HTTP client takes one flat dictionary:
 		 * `{ photos: [a, b], meta: { note: 'x' } }` -> `{ 'photos[0]': a, 'photos[1]': b, 'meta[note]': 'x' }`.
 		 * A key that already ends in `[]` keeps its name: `'photos[]': [a, b]` -> `photos[0]`, `photos[1]`.
-		 * null and undefined are left out; booleans and numbers become strings; binary values pass through.
+		 * null and undefined are left out; booleans and numbers become strings (with `keepPrimitives`, top-level
+		 * ones are passed as they are); binary values pass through.
 		 */
-		function flattenFields(body) {
+		function flattenFields(body, keepPrimitives) {
 			const out = {};
 			if (!body) {
 				return out;
 			}
 			const keys = Object.keys(body);
 			for (let i = 0; i < keys.length; i++) {
-				flattenField(out, keys[i], body[keys[i]]);
+				const value = body[keys[i]];
+				if (keepPrimitives && (typeof value === 'number' || typeof value === 'boolean')) {
+					out[keys[i]] = value; // a flat form body reaches the HTTP client exactly as 1.x passed it
+				} else {
+					flattenField(out, keys[i], value);
+				}
 			}
 			return out;
 		}

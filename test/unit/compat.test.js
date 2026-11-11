@@ -144,6 +144,32 @@ describe('callbacks (upstream API)', () => {
 		assert.equal(globalError.calls.length, 0);
 	});
 
+	it('with errorsAsObjects: false an unhandled error still goes to the success callback, as in 1.x', async () => {
+		const made = make({ errorsAsObjects: false });
+		ti.respond(() => ({ status: 422, body: { message: 'bad' } }));
+		const loaded = callback();
+		made.api.getVideos(loaded);
+		await wait(5);
+		assert.deepEqual(loaded.calls[0][0], { message: 'bad' }); // a 1.x screen waiting for this does not hang
+		ti.uninstall();
+		const strict = make({ errorsAsObjects: false, errorsToOnLoad: false, logger: () => {} });
+		ti.respond(() => ({ status: 422, body: { message: 'bad' } }));
+		const quiet = callback();
+		strict.api.getVideos(quiet);
+		await wait(5);
+		assert.equal(quiet.calls.length, 0);
+	});
+
+	it('error objects keep the platform\'s error text in `error`, as 1.x did', async () => {
+		const { api } = make();
+		ti.respond(() => ({ status: 500, body: {} }));
+		assert.equal((await rejection(api.getVideos())).error, 'HTTP error');
+		ti.respond(() => ({ error: 'Unable to resolve host' }));
+		const failure = await rejection(api.getVideos());
+		assert.equal(failure.error, 'Unable to resolve host');
+		assert.match(failure.message, /Unable to resolve host/);
+	});
+
 	it('no longer passes errors to the success callback unless errorsToOnLoad is set', async () => {
 		let made = make({ logger: () => {} });
 		ti.respond(() => ({ status: 500, body: { message: 'x' } }));

@@ -94,7 +94,7 @@ describe('retries', () => {
 		assert.equal(handle.idempotencyKey, keys[0]);
 	});
 
-	it('can be switched off for one endpoint or one call, and on for one call', async () => {
+	it('can be switched off for one endpoint or one call; a call cannot make a POST repeatable', async () => {
 		const { api } = make();
 		flaky(1, { status: 503 });
 		assert.equal((await rejection(api.never())).status, 503);
@@ -103,7 +103,8 @@ describe('retries', () => {
 		assert.equal((await rejection(api.get({}, { retry: false }))).status, 503);
 		ti.reset();
 		flaky(1, { status: 503 });
-		assert.deepEqual(await api.post({ body: {} }, { retry: { retries: 1, baseDelay: 1, jitter: 0 } }), { attempt: 2 });
+		assert.equal((await rejection(api.post({ body: {} }, { retry: { retries: 1, baseDelay: 1, jitter: 0 } }))).status, 503);
+		assert.equal(ti.requests.length, 1);
 	});
 
 	it('wait as long as Retry-After asks, up to the cap', async () => {

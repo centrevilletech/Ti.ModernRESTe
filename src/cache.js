@@ -56,12 +56,23 @@ function parseCacheControl(value) {
 	return out;
 }
 
+/** Response headers worth keeping on disk. Everything else (cookies above all) stays in memory only. */
+const PERSISTED_HEADERS = ['etag', 'last-modified', 'cache-control', 'content-type', 'vary'];
+
+/** Request headers that identify a user: a response that varies on one of them is never written to disk. */
+const CREDENTIAL_HEADER = /authorization|cookie|token|secret|key|session/i;
+
 /**
  * The HTTP response cache: memory first (least recently used entries are dropped past `maxEntries`), with an
  * optional persistent store behind it for entries whose policy says `persist: true`.
  *
- * A store is anything with getItem(key) -> string|null, setItem(key, string), removeItem(key) and, for
- * clear(), keys() -> string[]. `Reste.propertiesStore()` and `Reste.fileStore()` build one.
+ * A store is anything with getItem(key) -> string|null, setItem(key, string), removeItem(key) and keys() ->
+ * string[] (needed to invalidate and clear what a previous launch persisted). `Reste.fileStore()` and
+ * `Reste.propertiesStore()` build one.
+ *
+ * Every entry belongs to a tag (the method that made it). An invalidation bumps a version for what it
+ * covers; a request remembers the version from before it was sent (`stamp`) and its answer is only kept
+ * when nothing invalidated it in the meantime.
  */
 function createCache(options) {
 	const settings = options || {};
@@ -70,9 +81,26 @@ function createCache(options) {
 	const now = settings.now || clock;
 	const prefix = settings.prefix || 'reste_';
 	const memory = new Map();
+	const versions = { all: 0, tags: new Map(), keys: new Map() };
 
-	function storeKey(key) {
-		return prefix + hashString(key) + key.length.toString(36);
+	function tagPrefix(tag) {
+		return prefix + hashString(String(tag || '')) + '_';
+	}
+
+	function storeKey(key, tag) {
+		return tagPrefix(tag) + hashString(key) + key.length.toString(36);
+	}
+
+	function stamp(key, tag) {
+		return versions.all + ':' + (versions.tags.get(tag) || 0) + ':' + (versions.keys.get(key) || 0);
+	}
+
+	function bumpKey(key) {
+		if (versions.keys.size > 500) {
+			versions.keys.clear();
+			versions.all++; // forget the per-key versions without making an older stamp look current
+		}
+		versions.keys.set(key, (versions.keys.get(key) || 0) + 1);
 	}
 
 	function remember(key, entry) {
@@ -83,45 +111,48 @@ function createCache(options) {
 		}
 	}
 
-	function hydrate(key) {
+	function readStored(name) {
+		try {
+			const raw = store.getItem(name);
+			return raw ? JSON.parse(raw) : null;
+		} catch (error) {
+			return null;
+		}
+	}
+
+	function hydrate(key, tag) {
 		if (!store) {
 			return null;
 		}
-		let raw;
-		try {
-			raw = store.getItem(storeKey(key));
-		} catch (error) {
-			return null;
+		const saved = readStored(storeKey(key, tag));
+		if (!saved || saved.key !== key) {
+			return null; // nothing, or a different URL with the same hash
 		}
-		if (!raw) {
-			return null;
-		}
-		try {
-			const saved = JSON.parse(raw);
-			if (saved.key !== key) {
-				return null; // a different URL with the same hash
-			}
-			saved.body = undefined;
-			saved.persisted = true;
-			remember(key, saved);
-			return saved;
-		} catch (error) {
-			return null;
-		}
+		saved.body = undefined;
+		saved.persisted = true;
+		remember(key, saved);
+		return saved;
 	}
 
 	function persist(key, entry) {
 		if (!store || entry.text == null) {
 			return;
 		}
+		const headers = {};
+		PERSISTED_HEADERS.forEach((name) => {
+			if (entry.headers && entry.headers[name] !== undefined) {
+				headers[name] = entry.headers[name];
+			}
+		});
 		try {
-			store.setItem(storeKey(key), JSON.stringify({
+			store.setItem(storeKey(key, entry.tag), JSON.stringify({
 				key,
 				tag: entry.tag,
 				status: entry.status,
 				etag: entry.etag,
 				lastModified: entry.lastModified,
-				headers: entry.headers,
+				headers,
+				vary: entry.vary,
 				storedAt: entry.storedAt,
 				expiresAt: entry.expiresAt,
 				staleUntil: entry.staleUntil,
@@ -133,14 +164,25 @@ function createCache(options) {
 		}
 	}
 
-	function forget(key, entry) {
+	function forget(key, entry, tag) {
 		memory.delete(key);
 		if (store && (!entry || entry.persisted)) {
 			try {
-				store.removeItem(storeKey(key));
+				store.removeItem(storeKey(key, entry ? entry.tag : tag));
 			} catch (error) {
 				// Ignored: see persist().
 			}
+		}
+	}
+
+	function storedNames() {
+		if (!store || !isFunction(store.keys)) {
+			return [];
+		}
+		try {
+			return store.keys().filter(name => name.indexOf(prefix) === 0);
+		} catch (error) {
+			return [];
 		}
 	}
 
@@ -173,17 +215,48 @@ function createCache(options) {
 		return { expiresAt, staleUntil };
 	}
 
+	/** The request headers a response says it varies on, with a hash of the value each had. */
+	function varyOf(headers, requestHeader) {
+		const value = headers.vary;
+		if (!value) {
+			return null;
+		}
+		const names = String(value).split(',').map(name => name.trim().toLowerCase()).filter(Boolean);
+		if (names.indexOf('*') !== -1) {
+			return '*';
+		}
+		return names.map(name => ({ name, hash: hashString(String(requestHeader(name) || '')) }));
+	}
+
+	function sameVariant(entry, requestHeader) {
+		if (!entry.vary) {
+			return true;
+		}
+		for (let i = 0; i < entry.vary.length; i++) {
+			if (hashString(String(requestHeader(entry.vary[i].name) || '')) !== entry.vary[i].hash) {
+				return false;
+			}
+		}
+		return true;
+	}
+
 	return {
-		/** @returns {{entry: object, fresh: boolean, usableStale: boolean}|null} */
-		lookup(key) {
+		stamp,
+
+		/**
+		 * `requestHeader(name)` reads a header of the request being made: an entry whose response varied on a
+		 * header that now has another value is not a hit.
+		 * @returns {{entry: object, fresh: boolean, usableStale: boolean}|null}
+		 */
+		lookup(key, tag, requestHeader) {
 			let entry = memory.get(key);
 			if (entry) {
 				memory.delete(key);
 				memory.set(key, entry);
 			} else {
-				entry = hydrate(key);
+				entry = hydrate(key, tag);
 			}
-			if (!entry) {
+			if (!entry || (requestHeader && !sameVariant(entry, requestHeader))) {
 				return null;
 			}
 			const at = now();
@@ -195,14 +268,16 @@ function createCache(options) {
 		},
 
 		/**
-		 * Keeps a 2xx response. Returns the entry, or null when the response may not be cached (no-store) or
-		 * could never be used again (no freshness, no validator, no stale use).
+		 * Keeps a 2xx response. Returns the entry, or null when it may not be cached (no-store, Vary: *) or
+		 * could never be used again (no freshness, no validator, no stale use). The caller checks `stamp()`
+		 * first: an answer to a request that was invalidated while in flight is not stored.
 		 */
-		store(key, tag, policy, response) {
+		store(key, tag, policy, response, requestHeader) {
 			const headers = response.headers;
 			const times = expiry(policy, headers);
-			if (!times) {
-				forget(key);
+			const vary = varyOf(headers, requestHeader || (() => ''));
+			if (!times || vary === '*') {
+				forget(key, memory.get(key), tag);
 				return null;
 			}
 			const etag = policy.etag ? headers.etag || null : null;
@@ -211,12 +286,16 @@ function createCache(options) {
 			if (times.expiresAt === 0 && !validator && times.staleUntil === 0 && !policy.staleIfError) {
 				return null;
 			}
+			// A response that depends on who asked is never written to disk.
+			const personal = Boolean(vary && vary.some(item => CREDENTIAL_HEADER.test(item.name)));
+			const toDisk = Boolean(policy.persist && store && !personal);
 			const entry = {
 				tag,
 				status: response.status,
 				body: response.body,
-				text: policy.persist && store ? response.text : null,
+				text: toDisk ? response.text : null,
 				headers,
+				vary,
 				etag,
 				lastModified,
 				storedAt: now(),
@@ -225,14 +304,16 @@ function createCache(options) {
 				persisted: false
 			};
 			remember(key, entry);
-			if (policy.persist) {
+			if (toDisk) {
 				persist(key, entry);
 				entry.text = null; // the parsed body is what memory keeps
 			}
 			return entry;
 		},
 
-		/** After a 304: the stored copy is current again; take the new freshness from the 304's headers. */
+		/**
+		 * After a 304: the stored copy is current again; take the new freshness from the 304's headers.
+		 */
 		revalidated(key, entry, policy, headers) {
 			const times = expiry(policy, headers);
 			if (!times) {
@@ -249,12 +330,8 @@ function createCache(options) {
 				const parsed = entry.body !== undefined;
 				if (entry.text == null) {
 					// Entries drop their text once parsed; read it back rather than serialise the body again.
-					try {
-						const saved = JSON.parse(store.getItem(storeKey(key)) || 'null');
-						entry.text = saved ? saved.text : null;
-					} catch (error) {
-						entry.text = null;
-					}
+					const saved = readStored(storeKey(key, entry.tag));
+					entry.text = saved ? saved.text : null;
 				}
 				persist(key, entry);
 				if (parsed) {
@@ -277,46 +354,92 @@ function createCache(options) {
 		},
 
 		/**
-		 * Drops entries: all of an endpoint (its method name), those whose key matches a RegExp, those a
-		 * function (entry, key) returns true for, or one exact key. Returns how many were dropped.
+		 * Drops entries, in memory and in the persistent store, and bumps the version that keeps requests
+		 * already in flight for them from being stored when they land: all of a method (its name), one
+		 * request (`baseKey`, with the method's name as `matcher`; every variant of it by scope or varying
+		 * header goes), those whose key matches a RegExp, those a function (entry, key) returns true for.
+		 * Returns how many were dropped.
 		 */
-		invalidate(matcher, exactKey) {
-			if (exactKey) {
-				const entry = memory.get(exactKey) || hydrate(exactKey);
-				if (entry) {
-					forget(exactKey, entry);
-					return 1;
-				}
-				return 0;
-			}
+		invalidate(matcher, baseKey) {
 			let dropped = 0;
+			if (baseKey) {
+				bumpKey(baseKey);
+				const variant = key => key === baseKey || key.indexOf(baseKey + '\n') === 0;
+				Array.from(memory.entries()).forEach((pair) => {
+					if (variant(pair[0])) {
+						forget(pair[0], pair[1]);
+						dropped++;
+					}
+				});
+				const wantedPrefix = tagPrefix(matcher);
+				storedNames().forEach((name) => {
+					if (name.indexOf(wantedPrefix) !== 0) {
+						return;
+					}
+					const saved = readStored(name);
+					if (saved && saved.key && variant(saved.key)) {
+						try {
+							store.removeItem(name);
+							dropped++;
+						} catch (error) {
+							// Ignored: see persist().
+						}
+					}
+				});
+				return dropped;
+			}
+			const byTag = typeof matcher === 'string';
+			if (byTag) {
+				versions.tags.set(matcher, (versions.tags.get(matcher) || 0) + 1);
+			} else {
+				versions.all++; // a pattern cannot be mapped to requests in flight: none of them is stored
+			}
+			const hit = (entry, key) => (byTag ? entry.tag === matcher
+				: matcher instanceof RegExp ? matcher.test(key)
+					: isFunction(matcher) ? Boolean(matcher(entry, key)) : false);
+			const removed = new Set();
 			Array.from(memory.entries()).forEach((pair) => {
-				const key = pair[0];
-				const entry = pair[1];
-				const hit = typeof matcher === 'string' ? entry.tag === matcher
-					: matcher instanceof RegExp ? matcher.test(key)
-						: isFunction(matcher) ? matcher(entry, key) : false;
-				if (hit) {
-					forget(key, entry);
+				if (hit(pair[1], pair[0])) {
+					removed.add(storeKey(pair[0], pair[1].tag));
+					forget(pair[0], pair[1]);
 					dropped++;
+				}
+			});
+			// What a previous launch persisted and this one has not read yet.
+			const wanted = byTag ? tagPrefix(matcher) : null;
+			storedNames().forEach((name) => {
+				if (removed.has(name)) {
+					return;
+				}
+				let match = false;
+				if (byTag) {
+					match = name.indexOf(wanted) === 0;
+				} else {
+					const saved = readStored(name);
+					match = Boolean(saved && saved.key && hit(saved, saved.key));
+				}
+				if (match) {
+					try {
+						store.removeItem(name);
+						dropped++;
+					} catch (error) {
+						// Ignored: see persist().
+					}
 				}
 			});
 			return dropped;
 		},
 
 		clear() {
+			versions.all++;
 			memory.clear();
-			if (store && isFunction(store.keys)) {
+			storedNames().forEach((name) => {
 				try {
-					store.keys().forEach((key) => {
-						if (key.indexOf(prefix) === 0) {
-							store.removeItem(key);
-						}
-					});
+					store.removeItem(name);
 				} catch (error) {
 					// Ignored: see persist().
 				}
-			}
+			});
 		},
 
 		get size() {
