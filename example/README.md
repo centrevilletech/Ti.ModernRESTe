@@ -37,7 +37,7 @@ and write one line each to the log:
 RESTE-CHECK PASS a timeout is reported as a timeout [after 713ms; platform message: "The request timed out." code -1001]
 RESTE-CHECK FAIL <name>: <reason>
 RESTE-BENCH collection-refetch-unchanged-ms 5
-RESTE-CHECK DONE pass=45 fail=0 platform=iphone sdk=13.4.1
+RESTE-CHECK DONE pass=48 fail=0 platform=iphone sdk=13.4.1
 ```
 
 ```bash
@@ -52,7 +52,7 @@ own Backbone and a bound `TableView`. The code is in `app/lib/checks.js`.
 
 ## Results
 
-Titanium SDK 13.4.1.GA, Alloy 3.0.1, Backbone 1.4.0, both 45 of 45.
+Titanium SDK 13.4.1.GA, Alloy 3.0.1, Backbone 1.4.0: all 48 checks pass on both (47 in `checks.js` plus the data-binding check that uses the app's own `TableView`).
 
 | | Android 15 (x86_64 container, software rendering) | iOS 27.0 simulator (iPhone 18 Pro) |
 | --- | --- | --- |

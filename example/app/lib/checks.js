@@ -5,6 +5,9 @@
  * client reports timeouts, dropped connections, 304s, headers and progress, that multipart bodies arrive
  * intact, that Alloy's own Backbone and data binding work with the collections.
  *
+ * There are 47 checks in this file; run() adds one more that needs the app's bound TableView, so a run in
+ * the example app reports 48.
+ *
  * Every check prints one line to the log, so a run can be read with `adb logcat` or the simulator's log:
  *   RESTE-CHECK PASS <name> [detail]
  *   RESTE-CHECK FAIL <name>: <reason>
@@ -186,7 +189,8 @@ check('DELETE without a body sends none; with a body: sent on iOS, dropped by An
 check('form-encoded body', async () => {
 	const echoed = await make().echoForm({ body: { user: 'a b', remember: true } });
 	assert(/^application\/x-www-form-urlencoded/.test(echoed.headers['content-type']), 'content type was ' + echoed.headers['content-type']);
-	assert(/user=a(\+|%20)b/.test(echoed.text) && /remember=true/.test(echoed.text), 'body was ' + echoed.text);
+	// Flat values reach the HTTP client as given (as in 1.x), so the platform decides how a boolean is written.
+	assert(/user=a(\+|%20)b/.test(echoed.text) && /remember=(true|1)/.test(echoed.text), 'body was ' + echoed.text);
 	return echoed.text;
 });
 
@@ -467,12 +471,48 @@ check('the debug logger prints no credentials', async () => {
 	const api = make({
 		debug: 'verbose',
 		logger: (level, message, details) => lines.push(message + ' ' + JSON.stringify(details || '')),
-		requestHeaders: { Authorization: 'Bearer DEVICE-SECRET' }
+		requestHeaders: { Authorization: 'Bearer DEVICE-SECRET', 'X-Access-Token': 'DEVICE-SECRET' }
 	});
-	await api.echo({ body: { password: 'DEVICE-SECRET', email: 'a@b.c' }, query: { access_token: 'DEVICE-SECRET' } });
+	await api.echo({ body: { password: 'DEVICE-SECRET', refreshToken: 'DEVICE-SECRET', email: 'a@b.c' }, query: { access_token: 'DEVICE-SECRET', 'X-Amz-Signature': 'DEVICE-SECRET' } });
+	await api.request({ get: 'echo?p=<token>' }, { token: 'DEVICE-SECRET' });
 	const output = lines.join('\n');
 	assert(output.indexOf('DEVICE-SECRET') === -1, 'a credential was logged');
 	assert(output.indexOf('[redacted]') !== -1 && output.indexOf('a@b.c') !== -1, 'expected redacted output');
+});
+
+check('default headers are not sent to another origin', async () => {
+	const api = make({ requestHeaders: { Authorization: 'Bearer DEVICE-TOKEN' } });
+	const other = SERVER.replace('127.0.0.1', 'localhost'); // the same server under another origin
+	const outside = await api.request({ method: 'POST', url: other + 'echo', unwrap: false }, { body: {} });
+	equal(outside.headers.authorization, undefined, 'token sent to another origin');
+	const inside = await api.echo({ body: {} });
+	equal(inside.headers.authorization, 'Bearer DEVICE-TOKEN', 'token on the API\'s own origin');
+});
+
+check('a header function that throws rejects the call', async () => {
+	const api = make({ requestHeaders: { Authorization: () => { throw new Error('no token yet'); } } });
+	let handle;
+	try {
+		handle = api.health();
+	} catch (error) {
+		throw new Error('the call threw: ' + error.message);
+	}
+	const error = await rejection(handle);
+	assert(/no token yet/.test(error.message), 'rejected with: ' + error.message);
+});
+
+check('a model made with { id } updates instead of creating', async () => {
+	const made = withModels();
+	try {
+		await made.api.reset();
+		const model = made.createThing({ id: 2, name: 'Second' });
+		equal(model.isNew(), false, 'isNew');
+		await model.save({ name: 'Second, renamed' });
+		equal((await made.api.getThing({ id: 2 })).name, 'Second, renamed', 'on the server');
+		equal((await made.api.getThings()).length, 3, 'no duplicate was created');
+	} finally {
+		made.cleanup();
+	}
 });
 
 check('upstream callbacks: onLoad, onError with retry, beforeSend, config.onLoad', async () => {
