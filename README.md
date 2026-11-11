@@ -1161,7 +1161,7 @@ the range between them:
 | Measurement | upstream | 2.0 | |
 | --- | --- | --- | --- |
 | loading the library: compiling and running its file | 0.9 ms | 6.5 to 7.5 ms | 206 kB against 16 kB. On an Android emulator (Titanium 13.4.1, desktop CPU) upstream's `require` takes about 1 ms and this one 8 to 10 ms |
-| the same, two-file build | | 4.2 to 5.5 ms | models, collections, lists and pagination stay in the second file until they are used |
+| the same, two-file build | | 4.2 to 5.5 ms | models, collections, lists and pagination stay in the second file until they are used. On that emulator the first file takes 5 to 6 ms, and the second 4 to 6 ms whenever it is read; on an iOS simulator (Apple M4) 2 ms and 2 to 3 ms |
 | load, `config()` with 20 methods, first request | 3.2 to 4.4 ms | 9.0 to 9.7 ms | a cold start |
 | the same, two-file build | | 5.8 to 8.1 ms | a cold start that only sends requests |
 | `config()` with 500 methods | 0.6 to 0.7 ms | 0.7 to 1.3 ms | 2.0 analyses a method on its first call |
