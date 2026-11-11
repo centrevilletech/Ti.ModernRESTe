@@ -624,10 +624,15 @@ declare namespace Reste {
 	}
 
 	interface ListOptions {
-		/** A collection from the models config, or its name. */
+		/** A collection from the models config, or its name. With `load`: any Backbone collection. */
 		collection: any;
 		/** Default: the collection's read method. */
 		method?: string;
+		/**
+		 * Loads a page through the app's own code instead of a method: gets the page's query and resolves
+		 * `{ items, meta }` (or the array). Items are plain objects or models already merged.
+		 */
+		load?: (query: Record<string, any>, context: { signal: AbortSignal; params: Record<string, any> }) => Promise<{ items: any[]; meta?: any } | any[]>;
 		params?: Record<string, any> | (() => Record<string, any>);
 		query?: Record<string, any> | (() => Record<string, any>);
 		filter?: (model: any) => boolean;
@@ -718,6 +723,12 @@ declare namespace Reste {
 
 		paginate<T = any>(method: string, options?: { params?: Record<string, any>; query?: Record<string, any>; perPage?: number; limit?: number; paginate?: Pagination; idAttribute?: string; request?: CallOptions }): Pager<T>;
 		list(options: ListOptions): List;
+		/** `collection.upsert()` for any Backbone collection, RESTe's own or the app's. */
+		upsert(collection: any, items: any | any[], options?: { position?: 'start' | 'end'; mode?: 'merge' | 'replace'; chunk?: number }): MergeResult | Promise<MergeResult>;
+		/** `model.replace()` for any Backbone model. */
+		replace<M = any>(model: M, attributes: Record<string, any>): M;
+		/** `model.optimistic()` for any Backbone model, `collection.optimistic()` for any Backbone collection. */
+		optimistic(target: any, attributes: Record<string, any>, send: () => Promise<any>, options?: { at?: number }): Promise<any>;
 
 		addModel(definition: ModelDefinition): any;
 		createModel(name: string, attributes?: Record<string, any>): any;

@@ -4,6 +4,14 @@
 
 ### Added
 
+- `api.list({ collection, load })`: a list whose pages come from a function
+  of the app (a service call) instead of a method, over RESTe's collections
+  or any Backbone collection
+- `api.upsert(collection, items)`, `api.replace(model, attributes)` and
+  `api.optimistic(target, attributes, send)`: the collection and model
+  helpers as functions, also for models and collections the app created
+  itself
+
 - A custom `logger` gets the facts of every line about a request as its
   third argument (`event`, `endpoint`, `method`, `url`, `attempt`, `status`,
   `kind`, `elapsed`, `duration`, `delay`, `fromCache`): enough to print a line

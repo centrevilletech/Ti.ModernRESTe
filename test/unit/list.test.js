@@ -5,7 +5,7 @@
 const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { setup, rejection, wait } = require('../helpers/setup');
-const { eachBackbone, installAlloy, uninstallAlloy } = require('../helpers/backbone');
+const { eachBackbone, installAlloy, uninstallAlloy, record } = require('../helpers/backbone');
 
 const STATUSES = ['open', 'open', 'done'];
 const all = Array.from({ length: 30 }, (unused, index) => ({ id: index + 1, title: 'Job ' + (index + 1), status: STATUSES[index % 3] }));
@@ -261,6 +261,173 @@ eachBackbone((Backbone, version) => {
 		it('needs a collection from the models config', () => {
 			assert.throws(() => api.list({ collection: new Backbone.Collection() }), /needs a collection/);
 			assert.throws(() => api.list({ collection: 'jobs', method: 'nope' }), /not defined/);
+		});
+
+		it('loads its pages through a function of the app when given `load`', async () => {
+			const asked = [];
+			const open = all.filter(job => job.status === 'open');
+			const list = api.list({
+				collection: 'jobs', filter: model => model.get('status') === 'open',
+				load(query, context) {
+					asked.push(query);
+					assert.equal(context.signal.aborted, false);
+					return wait(1).then(() => ({ items: open.slice((query.page - 1) * 5, query.page * 5), meta: { current_page: query.page, last_page: 4, total: 20 } }));
+				}
+			});
+			const states = [];
+			list.on('state', state => states.push(state));
+			const loading = list.load();
+			assert.equal(asked.length, 1); // asked before load() returns, as a method would be called
+			await loading;
+			assert.deepEqual(ids(list), [1, 2, 4, 5, 7]);
+			assert.equal(list.total, 20);
+			assert.equal(list.hasMore(), true);
+			await list.loadMore();
+			assert.deepEqual(asked, [{ page: 1, per_page: 5 }, { page: 2, per_page: 5 }]);
+			assert.deepEqual(ids(list), [1, 2, 4, 5, 7, 8, 10, 11, 13, 14]);
+			assert.equal(jobs.length, 10); // the list merged the rows into the collection
+			assert.equal(ti.requests.length, 0); // and sent nothing itself
+			assert.deepEqual(states, ['loading', 'idle', 'loadingMore', 'idle']);
+		});
+
+		it('`load` may hand over models it merged itself; what it rejects with is the list\'s error', async () => {
+			let down = false;
+			const list = api.list({
+				collection: 'jobs',
+				load: query => (down ? Promise.reject(new Error('down')) : Promise.resolve({
+					items: jobs.upsert(all.slice((query.page - 1) * 5, query.page * 5)).models, meta: { current_page: query.page, last_page: 6 }
+				}))
+			});
+			await list.load();
+			await list.loadMore();
+			assert.deepEqual(ids(list), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]); // in the pages' order, although they joined first
+			assert.equal(list.models()[0], jobs.get(1));
+			down = true;
+			const errors = [];
+			list.on('error', error => errors.push(error.message));
+			await list.loadMore();
+			assert.equal(list.state, 'error');
+			assert.equal(list.failedMore, true);
+			assert.deepEqual(errors, ['down']);
+			assert.equal(ids(list).length, 10);
+			const throwing = api.list({ collection: 'jobs', load: () => { throw new Error('threw'); } });
+			throwing.on('error', error => errors.push(error.message));
+			await throwing.load(); // never a throw from load(): the list's error
+			assert.deepEqual(errors, ['down', 'threw']);
+		});
+
+		it('follows a collection the app created itself when the pages come from `load`', async () => {
+			const own = new Backbone.Collection();
+			const asked = [];
+			const list = api.list({
+				collection: own, paginate: { style: 'cursor', limit: 3 },
+				load(query) {
+					asked.push(query);
+					const older = query.before ? all.filter(item => item.id < query.before) : all;
+					return Promise.resolve({ items: older.slice(-3), meta: { has_more: older.length > 3 } });
+				}
+			});
+			await list.load();
+			assert.deepEqual(ids(list), [28, 29, 30]);
+			await list.loadOlder();
+			assert.deepEqual(asked, [{ limit: 3 }, { limit: 3, before: 28 }]);
+			assert.deepEqual(ids(list), [25, 26, 27, 28, 29, 30]);
+			assert.equal(own.length, 6);
+			own.add({ id: 31 }); // from anywhere else: joins at the end of an oldest-first list
+			own.remove(own.get(29));
+			assert.deepEqual(ids(list), [25, 26, 27, 28, 30, 31]);
+			list.destroy();
+			own.add({ id: 32 });
+			assert.deepEqual(ids(list), [25, 26, 27, 28, 30, 31]);
+		});
+	});
+
+	describe('models and collections the app created itself on Backbone ' + version, () => {
+		let ti;
+		let api;
+
+		beforeEach(() => {
+			installAlloy(Backbone);
+			const made = setup({ models: [{ name: 'job', collections: [{ name: 'jobs' }] }] });
+			ti = made.ti;
+			api = made.api;
+		});
+		afterEach(() => {
+			uninstallAlloy();
+			ti.uninstall();
+		});
+
+		it('api.upsert() merges into any collection, with Backbone\'s own events', () => {
+			const own = new Backbone.Collection([{ id: 1, title: 'A', place: { city: 'X' } }, { id: 9, title: 'Z' }]);
+			const events = record(own);
+			const result = api.upsert(own, [{ id: 2, title: 'B' }, { id: 1, title: 'A2' }]);
+			assert.deepEqual(result.models.map(model => model.id), [2, 1]);
+			assert.deepEqual(result.added.map(model => model.id), [2]);
+			assert.equal(own.length, 3);
+			assert.deepEqual(own.get(1).get('place'), { city: 'X' }); // what the items lack stays
+			assert.equal(events.count('add'), 1);
+			assert.equal(events.count('change:title'), 1);
+			assert.equal(events.count('fetch'), 0);
+			assert.ok(result.models[0].receivedAt > 0);
+			assert.equal(api.upsert(own, { id: 3 }, { position: 'start' }).models[0], own.at(0));
+			assert.equal(api.upsert(own, [{ id: 3 }, { id: 1, title: 'A2' }]).touched, false);
+		});
+
+		it('api.replace() makes any model hold exactly the attributes', () => {
+			const me = new Backbone.Model({ id: 'u1', phone: '+1', stale: true });
+			let changes = 0;
+			me.on('change', () => changes++);
+			assert.equal(api.replace(me, { id: 'u1', phone: null }), me);
+			assert.deepEqual(me.toJSON(), { id: 'u1', phone: null });
+			changes = 0;
+			api.replace(me, { id: 'u1', phone: null });
+			assert.equal(changes, 0);
+		});
+
+		it('api.optimistic() changes any model now and puts it back on failure', async () => {
+			const me = new Backbone.Model({ id: 'u1', phone: null });
+			const error = await rejection(api.optimistic(me, { phone: '+2', note: 'x' }, () => {
+				assert.equal(me.get('phone'), '+2');
+				return Promise.reject(new Error('refused'));
+			}));
+			assert.equal(error.message, 'refused');
+			assert.equal(me.get('phone'), null);
+			assert.equal(me.has('note'), false);
+			assert.equal(await api.optimistic(me, { phone: '+3' }, () => Promise.resolve({ id: 'u1', phone: '+3', verified: true })), me);
+			assert.equal(me.get('verified'), true);
+		});
+
+		it('api.optimistic() adds to any collection now, then takes the server\'s id or goes away', async () => {
+			const own = new Backbone.Collection([{ id: 1 }]);
+			const sending = api.optimistic(own, { id: 'tmp', title: 'New' }, () => wait(1).then(() => ({ id: 50, title: 'New' })));
+			const temporary = own.get('tmp');
+			assert.equal(temporary.get('title'), 'New');
+			const created = await sending;
+			assert.equal(created, temporary);
+			assert.equal(created.id, 50);
+			assert.equal(own.get(50), created);
+			assert.equal(own.get('tmp'), undefined);
+			await rejection(api.optimistic(own, { id: 'tmp2' }, () => Promise.reject(new Error('no'))));
+			assert.equal(own.length, 2);
+			// The server's copy arrived first: that one stays.
+			const racing = api.optimistic(own, { id: 'tmp3' }, () => wait(5).then(() => ({ id: 60, confirmed: true })));
+			api.upsert(own, { id: 60, from: 'socket' });
+			const kept = own.get(60);
+			assert.equal(await racing, kept);
+			assert.equal(kept.get('confirmed'), true);
+			assert.equal(own.length, 3);
+		});
+
+		it('the same functions take RESTe\'s own models and collections', async () => {
+			const jobs = Alloy.Collections.jobs;
+			const events = record(jobs);
+			assert.equal(api.upsert(jobs, [{ id: 1, status: 'open' }]).models[0], jobs.get(1));
+			assert.equal(events.count('fetch'), 1); // merged as jobs.upsert() does: announced once
+			assert.equal(api.replace(jobs.get(1), { id: 1, status: 'done' }).get('status'), 'done');
+			await api.optimistic(jobs.get(1), { status: 'open' }, () => Promise.resolve());
+			assert.equal(jobs.get(1).get('status'), 'open');
+			const created = await api.optimistic(jobs, { id: 't' }, () => Promise.resolve({ id: 2 }));
+			assert.equal(jobs.get(2), created);
 		});
 	});
 

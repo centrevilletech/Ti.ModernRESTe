@@ -2763,10 +2763,27 @@
 
 			/**
 			 * A list that follows a collection: an ordered, filtered, paginated selection of its models that picks
-			 * up models arriving any other way. See the README, "Lists that follow a collection".
+			 * up models arriving any other way. Its pages come from the collection's read method, or from the app's
+			 * own `load(query, { signal })`. See the README, "Lists that follow a collection".
 			 */
 			reste.list = function (options) {
 				return data.liveList(options);
+			};
+
+			/**
+			 * collection.upsert(), model.replace(), model.optimistic() and collection.optimistic() as functions, for
+			 * models and collections the app created itself as well as RESTe's own.
+			 */
+			reste.upsert = function (collection, items, options) {
+				return data.upsert(collection, items, options);
+			};
+
+			reste.replace = function (model, attributes) {
+				return data.replace(model, attributes);
+			};
+
+			reste.optimistic = function (target, attributes, send, options) {
+				return data.optimistic(target, attributes, send, options);
 			};
 
 			/** Numbers for finding leaks: what is in flight, cached and kept per method and per model. */
@@ -4409,6 +4426,16 @@
 				});
 			}
 
+			function replaceAttributes(model, next) {
+				const gone = Object.keys(model.attributes).filter(key => !has(next, key));
+				gone.forEach(key => model.unset(key));
+				const diff = diffAttributes(model.attributes, next);
+				if (diff) {
+					model.set(diff);
+				}
+				return model;
+			}
+
 			function transformOf(config) {
 				 
 				return function (_model, transform) {
@@ -4725,14 +4752,7 @@
 					},
 					/** Makes the model hold exactly `attributes`: keys they lack are removed; only real changes fire. */
 					replace(attributes) {
-						const next = mirrored(record, attributes || {});
-						const gone = Object.keys(this.attributes).filter(key => !has(next, key));
-						gone.forEach(key => this.unset(key));
-						const diff = diffAttributes(this.attributes, next);
-						if (diff) {
-							this.set(diff);
-						}
-						return this;
+						return replaceAttributes(this, mirrored(record, attributes || {}));
 					}
 				});
 				records[args.name] = record;
@@ -5237,40 +5257,124 @@
 				}), () => (requestHandle && requestHandle.abort ? requestHandle.abort() : false));
 			}
 
-			/** api.list(): a list that follows one of the collections (see list.js). */
+			// ------------------------------------------------------------------ the app's own models and collections
+
+			/**
+			 * What RESTe needs to know about a collection it did not create: its model class and id attribute. Such
+			 * a collection keeps Backbone's own events (RESTe holds events back only on its own collections).
+			 */
+			function foreign(collection) {
+				const Model = collection.model || backbone().Model;
+				const idAttribute = (Model.prototype && Model.prototype.idAttribute) || 'id';
+				return {
+					record: { Model, idAttribute, sourceId: idAttribute, mirrorId: false, identity: null, destroying: null },
+					config: {},
+					mutations: 0
+				};
+			}
+
+			function foreignSettings(collection, settings, mode, position) {
+				const record = foreign(collection).record;
+				return {
+					Model: record.Model,
+					idAttribute: record.idAttribute,
+					mode,
+					position,
+					chunk: settings.chunk,
+					events: 'each',
+					isStale: (generation => () => generation !== state.generation)(state.generation)
+				};
+			}
+
+			/** api.upsert(collection, items, options): collection.upsert() for any Backbone collection. */
+			function upsert(collection, items, options) {
+				if (collection._reste) {
+					return collection.upsert(items, options);
+				}
+				const settings = options || {};
+				return merger.upsert(collection, Array.isArray(items) ? items : [items],
+					foreignSettings(collection, settings, settings.mode || 'merge', settings.position || 'end'));
+			}
+
+			/** api.replace(model, attributes): model.replace() for any Backbone model. */
+			function replace(model, attributes) {
+				return isFunction(model.replace) && records[model._type] ? model.replace(attributes) : replaceAttributes(model, attributes || {});
+			}
+
+			/**
+			 * api.optimistic(target, attributes, send, options): model.optimistic() for any Backbone model,
+			 * collection.optimistic() for any Backbone collection.
+			 */
+			function optimistic(target, attributes, send, options) {
+				if (Array.isArray(target.models) && isFunction(target.add)) {
+					return optimisticAdd(target._reste || foreign(target), target, attributes, send, options);
+				}
+				return optimisticChange(target, attributes, send);
+			}
+
+			/** api.list(): a list that follows a collection (see list.js). */
 			function liveList(options) {
 				const settings = options || {};
 				const collection = typeof settings.collection === 'string' ? collections[settings.collection] : settings.collection;
 				const meta = collection && collection._reste;
-				if (!meta) {
-					throw new Error('RESTe :: list() needs a collection from the models config');
+				const load = isFunction(settings.load) ? settings.load : null;
+				if (!collection || (!meta && !load)) {
+					throw new Error('RESTe :: list() needs a collection from the models config (or any collection, with `load`)');
 				}
-				const method = settings.method || meta.config.read;
-				if (!method || !state.hasMethod(method)) {
+				const config = meta ? meta.config : {};
+				const method = load ? null : settings.method || config.read;
+				if (!load && (!method || !state.hasMethod(method))) {
 					throw new Error('RESTe :: list() has no method to load from' + (method ? ' (' + method + ' is not defined)' : ''));
 				}
-				const endpoint = state.endpointOf(method);
-				const pagination = normalizePagination(settings.paginate !== undefined ? settings.paginate : meta.config.paginate,
+				const endpoint = state.endpointOf(method || config.read);
+				const pagination = normalizePagination(settings.paginate !== undefined ? settings.paginate : config.paginate,
 					endpoint ? endpoint.paginate : state.pagination);
 				return createLiveList({
 					Events: backbone().Events,
 					collection,
 					pagination,
-					content: settings.content !== undefined ? settings.content : meta.config.content,
+					content: settings.content !== undefined ? settings.content : (load ? undefined : config.content),
 					track: trackLoad,
 					request(params, query, signal) {
-						const all = Object.assign({}, meta.config.params, isFunction(params) ? params() : params);
-						const merged = Object.assign({}, meta.config.query, isFunction(query) ? query() : query);
+						const all = Object.assign({}, config.params, isFunction(params) ? params() : params);
+						const merged = Object.assign({}, config.query, isFunction(query) ? query() : query);
+						if (load) {
+							// The app loads the page itself (a service call, say) and answers { items, meta }. It is
+							// asked at once, as a method would be called at once; what it throws is a rejection.
+							let loading;
+							try {
+								loading = Promise.resolve(load(merged, { signal, params: all }));
+							} catch (error) {
+								loading = Promise.reject(error);
+							}
+							return loading.then(loadedPage);
+						}
 						if (Object.keys(merged).length) {
 							all.query = merged;
 						}
 						return state.call(method, all, Object.assign({}, settings.request, { fullResponse: true, signal }));
 					},
 					merge(items) {
+						if (!meta) {
+							return merger.upsert(collection, items, foreignSettings(collection, settings, 'merge', 'end'));
+						}
 						meta.mutations++;
 						return merger.upsert(collection, items, mergeSettings(meta, settings, 'merge', 'end'));
 					}
 				}, settings);
+			}
+
+			/** What a `load` function resolved, in the shape a page is read from. */
+			function loadedPage(result) {
+				const items = Array.isArray(result) ? result : (result && result.items);
+				return {
+					status: 200,
+					endpoint: 'load()',
+					body: result,
+					data: items,
+					meta: result && !Array.isArray(result) && result.meta !== undefined ? result.meta : null,
+					unchanged: false
+				};
 			}
 
 			function reset(options) {
@@ -5310,6 +5414,9 @@
 				modelFor,
 				createCollection,
 				liveList,
+				upsert,
+				replace,
+				optimistic,
 				collections,
 				records,
 				merger,

@@ -90,6 +90,17 @@ async function run(): Promise<void> {
 	const state: Reste.ListState = list.state;
 	list.destroy();
 
+	const own = { models: [] as unknown[] };
+	const loaded = api.list({
+		collection: own, paginate: { style: 'cursor', limit: 30 },
+		load: (query, context) => Promise.resolve({ items: [{ id: query.before, aborted: context.signal.aborted }], meta: { has_more: false } })
+	});
+	loaded.loadOlder();
+	const merged = api.upsert(own, [{ id: 1 }], { position: 'start' });
+	const replaced: { id: number } = api.replace({ id: 1 }, { id: 1, title: 'x' });
+	api.optimistic(own, { id: 'tmp' }, () => Promise.resolve({ id: 2 })).then(model => console.log(model, merged, replaced));
+	api.config({ logger: (level, message, details: Reste.LogEvent) => console.log(level, message, details && details.event === 'response' ? details.elapsed : 0) });
+
 	api.session.reset({ resetCollections: true });
 	api.cache.invalidate('getTodo', { id: 1 });
 	const remove = api.use({ response: response => response });

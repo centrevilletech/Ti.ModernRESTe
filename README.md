@@ -209,9 +209,10 @@ Callbacks receive `(data, response)`.
 Instance members: `config`, `setUrl`, `getUrl`, `clearCookies`,
 `setRequestHeaders`, `changeRequestHeader`, `removeRequestHeaderItem`,
 `getRequestHeaders`, `addMethod`, `removeMethod`, `hasMethod`, `request`,
-`use`, `paginate`, `list`, `session`, `cache`, `idempotency`, `abortAll`,
-`createAbortController`, `addModel`, `createModel`, `createCollection`,
-`model`, `collections`, `models`, `identity`, `inspect`. A method may not be named after
+`use`, `paginate`, `list`, `upsert`, `replace`, `optimistic`, `session`,
+`cache`, `idempotency`, `abortAll`, `createAbortController`, `addModel`,
+`createModel`, `createCollection`, `model`, `collections`, `models`,
+`identity`, `inspect`. A method may not be named after
 one of the 1.x members (`config`, `setUrl`, ...); it may take one of the newer
 names, and then hides that member on the instance.
 
@@ -809,6 +810,23 @@ attributes and the real id in place, and if the server's copy reached the
 collection first (a socket event beat the response) that one is kept and the
 temporary model is dropped.
 
+### Models and collections of your own
+
+`upsert()`, `replace()` and `optimistic()` also exist as functions that take
+the model or the collection, for the ones an app creates itself: a collection
+made in `alloy.js`, a model built on the fly, anything in a test.
+
+```javascript
+api.upsert(collection, items, { position: 'start' });   // collection.upsert()
+api.replace(model, attributes);                         // model.replace()
+api.optimistic(model, changes, send);                   // model.optimistic()
+api.optimistic(collection, attributes, send);           // collection.optimistic()
+```
+
+Given one of RESTe's own they do what the method does. A collection RESTe did
+not create keeps Backbone's own events: an `add` or a `change` per model, not
+one `update` and `fetch` per merge.
+
 ### Lists that follow a collection
 
 When one collection is the place where every model of a resource lives, the
@@ -842,6 +860,25 @@ joined on its own, it moves to where the server has it. What a page returns is
 taken as the server gave it; `filter` only decides about joining and dropping
 out. Cursor lists add `loadOlder()` and `loadNewer()`. `schedule` lets the app
 decide when a change is delivered (after a transition, say).
+
+Pages can also come from a function of your own, for an app whose screens go
+through a service layer instead of calling methods:
+
+```javascript
+const mine = api.list({
+    collection: Alloy.Collections.articles,                   // with `load`: any Backbone collection
+    paginate: { style: 'page', perPage: 20 },
+    filter: model => model.get('author') === me,
+    load: (query, { signal }) => articleService.mine(query, { signal })   // -> { items, meta }
+});
+```
+
+`load` gets the query of the page that is wanted (`{ page, per_page }`, or
+`{ limit, before }` / `{ limit, after }` for a cursor list) and resolves
+`{ items, meta }`, or just the array. The items may be plain objects, which
+the list merges into the collection, or models the function has merged itself;
+what it rejects with is the list's `error`. Everything else (order, joining,
+dropping out, `state`, `retry()`) is as above.
 
 ## Hooks from 1.x
 

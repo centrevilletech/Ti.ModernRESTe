@@ -534,10 +534,27 @@ function Reste() {
 
 	/**
 	 * A list that follows a collection: an ordered, filtered, paginated selection of its models that picks
-	 * up models arriving any other way. See the README, "Lists that follow a collection".
+	 * up models arriving any other way. Its pages come from the collection's read method, or from the app's
+	 * own `load(query, { signal })`. See the README, "Lists that follow a collection".
 	 */
 	reste.list = function (options) {
 		return data.liveList(options);
+	};
+
+	/**
+	 * collection.upsert(), model.replace(), model.optimistic() and collection.optimistic() as functions, for
+	 * models and collections the app created itself as well as RESTe's own.
+	 */
+	reste.upsert = function (collection, items, options) {
+		return data.upsert(collection, items, options);
+	};
+
+	reste.replace = function (model, attributes) {
+		return data.replace(model, attributes);
+	};
+
+	reste.optimistic = function (target, attributes, send, options) {
+		return data.optimistic(target, attributes, send, options);
 	};
 
 	/** Numbers for finding leaks: what is in flight, cached and kept per method and per model. */
