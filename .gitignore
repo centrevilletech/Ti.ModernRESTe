@@ -1,2 +1,11 @@
 node_modules
 npm-debug.log
+.DS_Store
+dist/
+*.tgz
+example/build/
+example/Resources/
+example/app/lib/reste.js
+example/plugins/
+example/i18n/
+bench/results/
