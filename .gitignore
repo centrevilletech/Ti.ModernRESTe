@@ -6,6 +6,6 @@ dist/
 example/build/
 example/Resources/
 example/app/lib/reste.js
-example/plugins/
-example/i18n/
 bench/results/
+example/i18n/
+example/platform/

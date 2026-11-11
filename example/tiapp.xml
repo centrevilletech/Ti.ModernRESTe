@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ti:app xmlns:ti="http://ti.tidev.io">
+	<id>com.centrevilletech.reste.example</id>
+	<name>ResteExample</name>
+	<version>2.0.0</version>
+	<publisher>Centreville Tech LLC</publisher>
+	<url>https://github.com/centrevilletech</url>
+	<description>Example and on-device checks for RESTe.</description>
+	<copyright>Apache-2.0</copyright>
+	<icon>appicon.png</icon>
+	<fullscreen>false</fullscreen>
+	<navbar-hidden>false</navbar-hidden>
+	<guid>9d8bdba0-3b86-427b-9862-14d9474830f6</guid>
+	<property name="ti.ui.defaultunit" type="string">dp</property>
+	<property name="run-on-main-thread" type="bool">true</property>
+	<!-- Where test/server/server.js listens. On an Android device: adb reverse tcp:8787 tcp:8787 -->
+	<property name="reste.server" type="string">http://127.0.0.1:8787/</property>
+	<!-- Run the on-device checks at launch and print RESTE-CHECK lines to the log. -->
+	<property name="reste.autorun" type="bool">true</property>
+	<ios>
+		<enable-launch-screen-storyboard>true</enable-launch-screen-storyboard>
+		<use-app-thinning>true</use-app-thinning>
+		<plist>
+			<dict>
+				<key>UISupportedInterfaceOrientations~iphone</key>
+				<array>
+					<string>UIInterfaceOrientationPortrait</string>
+				</array>
+				<key>UIRequiresPersistentWiFi</key>
+				<false/>
+				<key>UIStatusBarStyle</key>
+				<string>UIStatusBarStyleDefault</string>
+				<!-- The test server is plain HTTP on this machine. An app talking to a real API needs neither. -->
+				<key>NSAppTransportSecurity</key>
+				<dict>
+					<key>NSAllowsLocalNetworking</key>
+					<true/>
+				</dict>
+			</dict>
+		</plist>
+	</ios>
+	<android xmlns:android="http://schemas.android.com/apk/res/android">
+		<manifest xmlns:android="http://schemas.android.com/apk/res/android" android:versionCode="1">
+			<!-- usesCleartextTraffic: the test server is plain HTTP on localhost. -->
+			<application android:icon="@mipmap/ic_launcher" android:usesCleartextTraffic="true"/>
+		</manifest>
+	</android>
+	<modules>
+	</modules>
+	<deployment-targets>
+		<target device="android">true</target>
+		<target device="iphone">true</target>
+		<target device="ipad">false</target>
+	</deployment-targets>
+	<sdk-version>13.4.1.GA</sdk-version>
+	<plugins>
+		<plugin version="1.0">ti.alloy</plugin>
+	</plugins>
+</ti:app>

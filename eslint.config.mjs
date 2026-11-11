@@ -2,7 +2,7 @@ import js from '@eslint/js';
 import globals from 'globals';
 
 export default [
-	{ ignores: ['reste.js', 'node_modules/**', 'dist/**', 'example/build/**', 'example/Resources/**', 'example/app/lib/reste.js', 'example/platform/**'] },
+	{ ignores: ['reste.js', 'node_modules/**', 'dist/**', 'example/build/**', 'example/Resources/**', 'example/app/lib/reste.js', 'example/platform/**', 'example/plugins/**', 'example/i18n/**'] },
 	js.configs.recommended,
 	{
 		languageOptions: {

@@ -1,0 +1,10 @@
+".screen": { backgroundColor: "#ffffff" }
+".bar": { top: 0, height: 48, backgroundColor: "#f2f4f7" }
+".action": { top: 6, height: 36, width: Ti.UI.SIZE }
+".status": { top: 52, left: 12, right: 12, height: Ti.UI.SIZE, color: "#475467", font: { fontSize: 13 } }
+".list": { top: 76, bottom: 0 }
+".row": { height: 56 }
+".rowTitle": { top: 8, left: 16, right: 16, height: 22, color: "#101828", font: { fontSize: 16 } }
+".rowHint": { top: 32, left: 16, right: 16, height: 16, color: "#98a2b3", font: { fontSize: 11 } }
+".log": { top: 8, left: 12, right: 12, height: Ti.UI.SIZE, color: "#101828", font: { fontSize: 12, fontFamily: "monospace" } }
+".summary": { top: 14, right: 12, width: Ti.UI.SIZE, height: Ti.UI.SIZE, color: "#475467", font: { fontSize: 13 } }

@@ -1,0 +1,55 @@
+<Alloy>
+	<TabGroup id="tabs">
+		<Tab title="Things">
+			<Window title="Things (bound collection)" class="screen">
+				<View class="bar">
+					<Button class="action" left="8" onClick="onAddThing">Add</Button>
+					<Button class="action" left="88" onClick="onAddBadThing">Add invalid</Button>
+					<Button class="action" right="8" onClick="onRefreshThings">Refresh</Button>
+				</View>
+				<Label id="thingsStatus" class="status"/>
+				<TableView id="thingsTable" class="list" dataCollection="things" dataTransform="transformThing" onClick="onThingClick">
+					<TableViewRow class="row" thingId="{id}">
+						<Label class="rowTitle" text="{label}"/>
+						<Label class="rowHint" text="tap: +1 (optimistic)  ·  long list? swipe"/>
+					</TableViewRow>
+				</TableView>
+			</Window>
+		</Tab>
+		<Tab title="Items">
+			<Window title="Items (pagination)" class="screen">
+				<View class="bar">
+					<Button class="action" left="8" onClick="onMoreItems">Load more</Button>
+					<Button class="action" right="8" onClick="onRefreshItems">Refresh</Button>
+				</View>
+				<Label id="itemsStatus" class="status"/>
+				<TableView id="itemsTable" class="list" dataCollection="items" dataTransform="transformItem">
+					<TableViewRow class="row" title="{label}"/>
+				</TableView>
+			</Window>
+		</Tab>
+		<Tab title="Upload">
+			<Window title="Upload and download" class="screen" layout="vertical">
+				<Label class="status" top="16">A 2 MB file is uploaded as multipart/form-data with progress, and can be cancelled.</Label>
+				<ProgressBar id="uploadBar" top="16" left="16" right="16" min="0" max="1" value="0"/>
+				<Label id="uploadStatus" class="status" top="8">idle</Label>
+				<View class="bar" top="8">
+					<Button class="action" left="8" onClick="onUpload">Upload</Button>
+					<Button class="action" left="100" onClick="onCancelUpload">Cancel</Button>
+					<Button class="action" right="8" onClick="onDownload">Download</Button>
+				</View>
+			</Window>
+		</Tab>
+		<Tab title="Checks">
+			<Window title="On-device checks" class="screen">
+				<View class="bar">
+					<Button class="action" left="8" onClick="onRunChecks">Run checks</Button>
+					<Label id="checksSummary" class="summary"/>
+				</View>
+				<ScrollView top="52" bottom="0" layout="vertical" scrollType="vertical">
+					<Label id="checksLog" class="log"/>
+				</ScrollView>
+			</Window>
+		</Tab>
+	</TabGroup>
+</Alloy>
