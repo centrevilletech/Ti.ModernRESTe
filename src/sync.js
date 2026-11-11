@@ -1,7 +1,8 @@
 'use strict';
 
 const { ResteError } = require('./errors');
-const { createMerger, diffAttributes, isCoalesced } = require('./merge');
+const { createMerger, diffAttributes, isCoalesced, touch } = require('./merge');
+const { createLiveList } = require('./list');
 const { normalizePagination, createPager, readPage } = require('./pagination');
 const { isFunction, isObject, isPlainObject, has, noop, getPath, deepEqual, hashString } = require('./util');
 
@@ -16,7 +17,7 @@ const CALL_OPTIONS = ['headers', 'timeout', 'signal', 'retry', 'cache', 'force',
  * other models in the app (SQLite, properties, another RESTe instance) are not affected.
  */
 function createData(reste, state) {
-	const batch = { depth: 0, dirty: new Set() };
+	const batch = { depth: 0, dirty: new Map() };
 	const merger = createMerger(batch);
 	const records = Object.create(null); // model name -> { config, Model, idAttribute, mirrorId, identity }
 	const collections = Object.create(null); // collection name -> collection
@@ -192,6 +193,9 @@ function createData(reste, state) {
 			if (method === 'delete' && record.identity && model.id != null) {
 				record.identity.delete(model.id);
 			}
+			if (method !== 'delete') {
+				model.receivedAt = Date.now();
+			}
 			if (isFunction(settings.success)) {
 				settings.success(data);
 			}
@@ -274,6 +278,88 @@ function createData(reste, state) {
 		return Base.prototype.save.call(model, attrs, settings);
 	}
 
+	function optimisticChange(model, changes, send) {
+		const previous = {};
+		Object.keys(changes).forEach((name) => {
+			previous[name] = model.has(name) ? model.get(name) : undefined;
+		});
+		model.set(changes);
+		const result = Promise.resolve().then(send).then((resource) => {
+			if (isPlainObject(resource)) {
+				const diff = diffAttributes(model.attributes, resource);
+				if (diff) {
+					model.set(diff);
+				}
+				model.receivedAt = Date.now();
+			}
+			return model;
+		}, (error) => {
+			Object.keys(changes).forEach((name) => {
+				if (deepEqual(model.get(name), changes[name])) {
+					if (previous[name] === undefined) {
+						model.unset(name);
+					} else {
+						model.set(name, previous[name]);
+					}
+				}
+			});
+			model.trigger('rollback', model, error, {});
+			throw error;
+		});
+		return result;
+	}
+
+	/**
+	 * collection.optimistic(attributes, send): the model is in the list now; when `send()` resolves the
+	 * server's resource it takes those attributes (and the real id) in place, and when it fails the model is
+	 * taken out again. If the server's copy got into the collection first (a socket event beat the response),
+	 * that one is kept and the temporary model is dropped.
+	 */
+	function optimisticAdd(meta, collection, attributes, send, options) {
+		const record = meta.record;
+		const model = new record.Model(mirrored(record, attributes));
+		collection.add(model, options);
+		meta.mutations++;
+		return Promise.resolve().then(send).then((resource) => {
+			if (isPlainObject(resource)) {
+				return settleCreated(meta, collection, model, mirrored(record, resource));
+			}
+			return model;
+		}, (error) => {
+			collection.remove(model);
+			model.trigger('rollback', model, error, {});
+			throw error;
+		});
+	}
+
+	/** Gives a model created on the client its server attributes, or folds it into the copy that already arrived. */
+	function settleCreated(meta, collection, model, resource) {
+		const record = meta.record;
+		const id = resource[record.idAttribute];
+		const existing = id != null && id !== model.id ? collection.get(id) || (record.identity ? record.identity.get(id) : null) : null;
+		if (existing && existing !== model) {
+			collection.remove(model);
+			const diff = diffAttributes(existing.attributes, resource);
+			if (diff) {
+				existing.set(diff);
+			}
+			if (collection.get(id) !== existing) {
+				collection.add(existing);
+			}
+			existing.receivedAt = Date.now();
+			return existing;
+		}
+		const diff = diffAttributes(model.attributes, resource);
+		if (diff) {
+			model.set(diff);
+		}
+		model.receivedAt = Date.now();
+		if (record.identity && model.id != null) {
+			record.identity.set(model.id, model);
+		}
+		return model;
+	}
+
 	/** destroy({ optimistic: true }): removed at once, put back where it was if the server refuses. */
 	function optimisticDestroy(Base, model, options) {
 		const settings = options ? Object.assign({}, options) : {};
@@ -336,6 +422,14 @@ function createData(reste, state) {
 			},
 			destroy(options) {
 				return optimisticDestroy(Base, this, options);
+			},
+			/**
+			 * An optimistic change whose request is not the model's own save: the attributes change now,
+			 * `send()` (a function returning a promise) runs, and they are put back if it fails. When it
+			 * resolves an object, that is merged in as the server's answer.
+			 */
+			optimistic(changes, send) {
+				return optimisticChange(this, changes, send);
 			},
 			/** Makes the model hold exactly `attributes`: keys they lack are removed; only real changes fire. */
 			replace(attributes) {
@@ -449,6 +543,7 @@ function createData(reste, state) {
 			// What the collection held after its last refresh, to recognise "nothing changed" cheaply.
 			mutations: 0, cleanAt: -1, lastUrl: null, lastEtag: null, lastHash: null, lastLength: -1
 		};
+		collection._reste = meta;
 		collection._type = record.config.name;
 		collection._name = config.name;
 		collection.model = record.Model;
@@ -464,7 +559,18 @@ function createData(reste, state) {
 				meta.mutations++;
 			}
 			if (batch.depth > 0 && isCoalesced(name)) {
-				batch.dirty.add(this);
+				// Held back while a merge runs; the merge announces everything once at its end.
+				const entry = touch(batch.dirty, this);
+				const model = arguments[1];
+				if (model && model.cid !== undefined) {
+					if (name === 'change') {
+						entry.merged.add(model);
+					} else if (name === 'add') {
+						entry.added.add(model);
+					} else if (name === 'remove') {
+						entry.removed.add(model);
+					}
+				}
 				return this;
 			}
 			return Base.trigger.apply(this, arguments);
@@ -508,6 +614,10 @@ function createData(reste, state) {
 				settings.position || 'end'));
 		};
 
+		collection.optimistic = function (attributes, send, options) {
+			return optimisticAdd(meta, this, attributes, send, options);
+		};
+
 		/** create(attrs, { optimistic: true }): shown at once, taken out again if the server refuses it. */
 		collection.create = function (attributes, options) {
 			const settings = options ? Object.assign({}, options) : {};
@@ -528,6 +638,19 @@ function createData(reste, state) {
 					userError.apply(this, arguments);
 				} else if (created && isLegacy()) {
 					created.trigger('error', created, failure, settings);
+				}
+			};
+			const userSuccess = settings.success;
+			settings.success = function () {
+				// The server's copy may have reached the collection first (a socket event): keep one row.
+				if (created && created.id != null) {
+					const twin = self.models.find(other => other !== created && other.id === created.id);
+					if (twin) {
+						self.remove(twin);
+					}
+				}
+				if (isFunction(userSuccess)) {
+					userSuccess.apply(this, arguments);
 				}
 			};
 			delete settings.optimistic; // the model's own save must not try to roll attributes back
@@ -697,6 +820,7 @@ function createData(reste, state) {
 		}
 		const generation = state.generation;
 		const replace = direction === 'refresh';
+		const skipUnchanged = (settings.skipUnchanged !== undefined ? settings.skipUnchanged : config.skipUnchanged) !== false;
 		const done = (page) => {
 			const body = page.response ? page.response.body : null;
 			if (isFunction(settings.success)) {
@@ -710,7 +834,7 @@ function createData(reste, state) {
 		const isClean = url => meta.cleanAt === meta.mutations && meta.lastUrl === url && collection.length > 0;
 		const requestOptions = () => {
 			const options = callOptions(settings);
-			if (replace && config.skipUnchanged !== false && meta.lastHash !== null && meta.cleanAt === meta.mutations && collection.length > 0) {
+			if (replace && skipUnchanged && meta.lastHash !== null && meta.cleanAt === meta.mutations && collection.length > 0) {
 				// Lets the request skip parsing when the server sends the same bytes again.
 				options.unchangedIf = { url: meta.lastUrl, length: meta.lastLength, hash: meta.lastHash };
 			}
@@ -727,7 +851,7 @@ function createData(reste, state) {
 			if (page.unchanged) {
 				return unchanged(); // the same bytes as the last refresh, and nothing touched the collection since
 			}
-			if (replace && config.skipUnchanged !== false) {
+			if (replace && skipUnchanged) {
 				const etag = response.header('ETag');
 				if (response.fromCache) {
 					// A cache hit or a 304 for the representation this collection was last refreshed from.
@@ -802,6 +926,41 @@ function createData(reste, state) {
 		}), () => (requestHandle && requestHandle.abort ? requestHandle.abort() : false));
 	}
 
+	/** api.list(): a list that follows one of the collections (see list.js). */
+	function liveList(options) {
+		const settings = options || {};
+		const collection = typeof settings.collection === 'string' ? collections[settings.collection] : settings.collection;
+		const meta = collection && collection._reste;
+		if (!meta) {
+			throw new Error('RESTe :: list() needs a collection from the models config');
+		}
+		const method = settings.method || meta.config.read;
+		if (!method || !state.hasMethod(method)) {
+			throw new Error('RESTe :: list() has no method to load from' + (method ? ' (' + method + ' is not defined)' : ''));
+		}
+		const endpoint = state.endpointOf(method);
+		const pagination = normalizePagination(settings.paginate !== undefined ? settings.paginate : meta.config.paginate,
+			endpoint ? endpoint.paginate : state.pagination);
+		return createLiveList({
+			Events: backbone().Events,
+			collection,
+			pagination,
+			content: settings.content !== undefined ? settings.content : meta.config.content,
+			request(params, query, signal) {
+				const all = Object.assign({}, meta.config.params, isFunction(params) ? params() : params);
+				const merged = Object.assign({}, meta.config.query, isFunction(query) ? query() : query);
+				if (Object.keys(merged).length) {
+					all.query = merged;
+				}
+				return state.call(method, all, Object.assign({}, settings.request, { fullResponse: true, signal }));
+			},
+			merge(items) {
+				meta.mutations++;
+				return merger.upsert(collection, items, mergeSettings(meta, settings, 'merge', 'end'));
+			}
+		}, settings);
+	}
+
 	function reset(options) {
 		Object.keys(records).forEach((name) => {
 			if (records[name].identity) {
@@ -830,6 +989,7 @@ function createData(reste, state) {
 		createModel,
 		modelFor,
 		createCollection,
+		liveList,
 		collections,
 		records,
 		merger,

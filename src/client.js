@@ -89,8 +89,8 @@ function parseBody(text, http) {
 }
 
 function toResteError(error) {
-	if (error instanceof ResteError) {
-		return error;
+	if (error instanceof Error) {
+		return error; // a ResteError, or the app's own error thrown by an interceptor: passed on untouched
 	}
 	const message = error && error.message ? error.message : String(error);
 	return ResteError('config', message, { cause: error });
@@ -563,6 +563,11 @@ function createPipeline(state) {
 		}
 
 		ctx.sentSeq = ++state.seq;
+		if (config.failWhenOffline && typeof Ti !== 'undefined' && Ti.Network && Ti.Network.online === false) {
+			// Asked not to wait for a timeout when the device already knows it has no connection.
+			received(ctx, { status: 0, http: null, event: { error: 'The device is offline' }, elapsed: 0 });
+			return;
+		}
 		const log = logger();
 		if (log.enabled) {
 			log.log(method + ' ' + log.redactUrl(ctx.url) + (ctx.attempt > 1 ? ' (attempt ' + ctx.attempt + ')' : ''));

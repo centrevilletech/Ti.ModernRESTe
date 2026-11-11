@@ -15,8 +15,11 @@ const { isFunction, isObject, isPlainObject, has, uuid } = require('./util');
 const VERSION = '2.0.0';
 
 /** The members upstream 1.x defined on an instance: a method may not take one of these names. */
-const RESERVED = ['config', 'setUrl', 'getUrl', 'clearCookies', 'setRequestHeaders', 'changeRequestHeader',
-	'removeRequestHeaderItem', 'addMethod', 'addModel', 'createModel', 'createCollection', 'modelConfig'];
+const RESERVED = Object.create(null);
+['config', 'setUrl', 'getUrl', 'clearCookies', 'setRequestHeaders', 'changeRequestHeader', 'removeRequestHeaderItem',
+	'addMethod', 'addModel', 'createModel', 'createCollection', 'modelConfig'].forEach((name) => {
+	RESERVED[name] = true;
+});
 
 const VERBS = ['post', 'get', 'put', 'patch', 'delete', 'head']; // upstream's order: the last one defined wins
 
@@ -258,7 +261,10 @@ function Reste() {
 		}
 
 		reste.setRequestHeaders(config.requestHeaders);
-		(config.methods || []).forEach(method => reste.addMethod(method));
+		const methods = config.methods || [];
+		for (let i = 0; i < methods.length; i++) {
+			reste.addMethod(methods[i]);
+		}
 		(config.models || []).forEach(model => reste.addModel(model));
 		return reste;
 	};
@@ -322,11 +328,13 @@ function Reste() {
 	// ------------------------------------------------------------------ methods
 
 	reste.addMethod = function (args) {
+		// Kept cheap: an app may define hundreds of methods at start and call a handful. The definition is
+		// only looked at when the method is first called.
 		const name = args.name;
-		if (records.has(name) || RESERVED.indexOf(name) !== -1) {
+		if (RESERVED[name] === true || records.has(name)) {
 			throw new Error('RESTe :: method already defined and will be overwritten: ' + name);
 		}
-		if (has(reste, name)) {
+		if (state.logger.enabled && has(reste, name)) {
 			state.logger.warn('method "' + name + '" hides RESTe\'s own ' + name + ' on this instance');
 		}
 		const record = { def: args, endpoint: null, variants: null, fn: null };
@@ -508,6 +516,14 @@ function Reste() {
 	/** The instance for an id of an `identity` model (created empty when not known yet). */
 	reste.model = function (name, id) {
 		return data.modelFor(name, id);
+	};
+
+	/**
+	 * A list that follows a collection: an ordered, filtered, paginated selection of its models that picks
+	 * up models arriving any other way. See the README, "Lists that follow a collection".
+	 */
+	reste.list = function (options) {
+		return data.liveList(options);
 	};
 
 	reste.collections = data.collections;

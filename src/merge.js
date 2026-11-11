@@ -41,11 +41,22 @@ function isCoalesced(name) {
 		|| name === 'reset' || (typeof name === 'string' && name.indexOf('change:') === 0);
 }
 
+/** The record of what changed in one collection while events were held back. */
+function touch(dirty, collection) {
+	let entry = dirty.get(collection);
+	if (!entry) {
+		entry = { added: new Set(), removed: new Set(), merged: new Set() };
+		dirty.set(collection, entry);
+	}
+	return entry;
+}
+
 /**
  * Merging API items into Backbone collections without rebuilding them. Works on every Backbone version Alloy
  * ships (0.9.2 has no Collection#set), so it does not use Backbone's own merge.
  *
- * `batch` is shared by all collections of one RESTe instance: { depth, dirty }.
+ * `batch` is shared by all collections of one RESTe instance: { depth, dirty }, where dirty maps each
+ * collection that held an event back to what changed in it.
  */
 function createMerger(batch) {
 	/**
@@ -61,7 +72,8 @@ function createMerger(batch) {
 		const replace = settings.mode === 'replace';
 		const coalesce = settings.events !== 'each';
 		const atStart = settings.position === 'start';
-		const job = { models: [], added: [], changed: [], removed: [], dirty: new Set(), insertAt: 0, reordered: false };
+		const job = { models: [], added: [], changed: [], removed: [], dirty: new Map(), insertAt: 0, reordered: false };
+		const receivedAt = Date.now();
 		const pending = new Map(); // id (or cid) -> model seen in this merge and not in the collection yet
 
 		function begin() {
@@ -72,9 +84,18 @@ function createMerger(batch) {
 
 		function end() {
 			if (coalesce && --batch.depth === 0) {
-				batch.dirty.forEach(touched => job.dirty.add(touched));
+				carry(batch.dirty, job.dirty);
 				batch.dirty.clear();
 			}
+		}
+
+		function carry(from, to) {
+			from.forEach((entry, touched) => {
+				const target = touch(to, touched);
+				entry.added.forEach(model => target.added.add(model));
+				entry.removed.forEach(model => target.removed.add(model));
+				entry.merged.forEach(model => target.merged.add(model));
+			});
 		}
 
 		function find(id) {
@@ -122,6 +143,7 @@ function createMerger(batch) {
 					if (identity && model.id != null && !identity.has(model.id)) {
 						identity.set(model.id, model);
 					}
+					model.receivedAt = receivedAt; // when the server last sent this model
 					job.models.push(model);
 					const key = model.id != null ? model.id : model.cid;
 					if (!pending.has(key) && !holds(collection, model)) {
@@ -221,18 +243,24 @@ function createMerger(batch) {
 				return result;
 			}
 			if (touched) {
-				job.dirty.add(collection);
+				const own = touch(job.dirty, collection);
+				job.added.forEach(model => own.added.add(model));
+				job.removed.forEach(model => own.removed.add(model));
+				job.changed.forEach(model => own.merged.add(model));
 			}
 			if (batch.depth > 0) {
 				// Inside another merge: that one announces the change.
-				job.dirty.forEach(dirty => batch.dirty.add(dirty));
+				carry(job.dirty, batch.dirty);
 				return result;
 			}
+			// One "update" with what changed and one render event per collection that was touched: the one
+			// merged into, and any other that holds a model this merge changed.
 			const changeEvent = settings.changeEvent || 'fetch';
-			job.dirty.forEach((dirty) => {
-				if (dirty === collection) {
-					dirty.trigger('update', dirty, { changes: { added: job.added, removed: job.removed, merged: job.changed } });
-				}
+			job.dirty.forEach((entry, dirty) => {
+				dirty.trigger('update', dirty, {
+					reste: true,
+					changes: { added: Array.from(entry.added), removed: Array.from(entry.removed), merged: Array.from(entry.merged) }
+				});
 				dirty.trigger(changeEvent, dirty, { reste: true });
 			});
 			return result;
@@ -262,11 +290,13 @@ function createMerger(batch) {
 					reject(error);
 				}
 			};
-			step();
+			// The first chunk waits a turn as well: the response was parsed just before this, and that is
+			// already the longest thing this request does in one go.
+			later(step, 0);
 		});
 	}
 
 	return { upsert };
 }
 
-module.exports = { createMerger, diffAttributes, isCoalesced };
+module.exports = { createMerger, diffAttributes, isCoalesced, touch };
