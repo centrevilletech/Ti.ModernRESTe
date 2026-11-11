@@ -1,10 +1,7 @@
 {
   "name": "@centrevilletech/reste",
   "version": "2.0.0",
-  "description": "A JavaScript REST / API helper for Titanium with Alloy Models/Collections support. A maintained fork of RESTe: promises, retries, caching, pagination, uploads, scoped sync.",
-  "titaniumManifest": {
-    "guid": "afafe8b0-b93b-771c-a9e5-4e71db81b9ff"
-  },
+  "description": "A REST / API helper for Titanium with Alloy models and collections. A maintained fork of RESTe by Jason Kneen: promises, retries, caching, pagination, uploads, scoped sync.",
   "main": "reste.js",
   "types": "reste.d.ts",
   "files": [
@@ -22,11 +19,12 @@
     "test:src": "node --test \"test/unit/*.test.js\" \"test/integration/*.test.js\"",
     "types": "tsc -p test/types",
     "bench": "node --expose-gc bench/run.js",
-    "server": "node test/server/server.js"
+    "server": "node test/server/server.js",
+    "mutate": "node scripts/mutate.js"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/centrevilletech/Ti.ModernRESTe.git"
+    "url": "git+https://github.com/centrevilletech/Ti.ModernRESTe.git"
   },
   "keywords": [
     "alloy",
@@ -38,15 +36,21 @@
     "titanium-module",
     "titanium-sdk"
   ],
-  "author": "Jason Kneen",
+  "author": {
+    "name": "Jason Kneen",
+    "url": "https://github.com/jasonkneen"
+  },
   "contributors": [
-    "Centreville Tech LLC (https://github.com/centrevilletech)"
+    {
+      "name": "Centreville Tech LLC",
+      "url": "https://github.com/centrevilletech"
+    }
   ],
   "license": "Apache-2.0",
   "bugs": {
     "url": "https://github.com/centrevilletech/Ti.ModernRESTe/issues"
   },
-  "homepage": "https://github.com/centrevilletech/Ti.ModernRESTe",
+  "homepage": "https://github.com/centrevilletech/Ti.ModernRESTe#readme",
   "engines": {
     "node": ">=18"
   },
@@ -62,5 +66,14 @@
     "globals": "^15.12.0",
     "typescript": "^5.6.3",
     "underscore": "1.13.6"
+  },
+  "maintainers": [
+    {
+      "name": "Centreville Tech LLC",
+      "url": "https://github.com/centrevilletech"
+    }
+  ],
+  "publishConfig": {
+    "access": "public"
   }
 }
