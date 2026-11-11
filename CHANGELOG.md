@@ -25,6 +25,10 @@
 
 ### Fixed
 
+- A response with no freshness left and no validator (`ttl: 0`, or the
+  `'etag'` policy, answered without an `ETag`) was kept, and persisted,
+  although it could never be served again
+
 - Rolling back an optimistic change removed an attribute whose value had been
   `null` (Backbone's `has()` is false for it) instead of restoring the `null`
 

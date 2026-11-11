@@ -375,7 +375,8 @@
 					const etag = policy.etag ? headers.etag || null : null;
 					const lastModified = policy.etag ? headers['last-modified'] || null : null;
 					const validator = Boolean(etag || lastModified);
-					if (times.expiresAt === 0 && !validator && times.staleUntil === 0 && !policy.staleIfError) {
+					if (times.expiresAt <= now() && !validator && times.staleUntil === 0 && !policy.staleIfError) {
+						forget(key, memory.get(key), tag); // what an earlier answer left is not this one's validator
 						return null;
 					}
 					// A response that depends on who asked is never written to disk.

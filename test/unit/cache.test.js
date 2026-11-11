@@ -263,6 +263,25 @@ describe('caching', () => {
 		assert.equal(store.items.size, 0);
 	});
 
+	it('does not keep a response it could never use again: no freshness left and no validator', async () => {
+		const store = { items: new Map() };
+		store.getItem = key => (store.items.has(key) ? store.items.get(key) : null);
+		store.setItem = (key, value) => store.items.set(key, value);
+		store.removeItem = key => store.items.delete(key);
+		store.keys = () => Array.from(store.items.keys());
+		const { api } = make({ cache: { store }, methods: [{ name: 'catalog', get: 'catalog', cache: { persist: true, ttl: 0 } }] });
+		ti.respond(() => ({ status: 200, body: { list: [1] } })); // no ETag, no Last-Modified
+		await api.catalog();
+		assert.equal(api.cache.size, 0);
+		assert.equal(store.items.size, 0);
+		ti.respond(() => ({ status: 200, body: { list: [1] }, headers: { ETag: '"p1"' } }));
+		await api.catalog();
+		assert.equal(store.items.size, 1); // with a validator it can be revalidated: kept
+		ti.respond(() => ({ status: 200, body: { list: [2] } }));
+		assert.deepEqual(await api.catalog(), { list: [2] });
+		assert.equal(store.items.size, 0); // and the copy that answer replaced does not stay behind
+	});
+
 	it('the Titanium property and file stores round-trip', async () => {
 		const made = make({});
 		for (const store of [made.Reste.propertiesStore(), made.Reste.fileStore('reste-test')]) {
