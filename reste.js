@@ -562,8 +562,8 @@
 		}
 
 		function toResteError(error) {
-			if (error instanceof ResteError) {
-				return error;
+			if (error instanceof Error) {
+				return error; // a ResteError, or the app's own error thrown by an interceptor: passed on untouched
 			}
 			const message = error && error.message ? error.message : String(error);
 			return ResteError('config', message, { cause: error });
@@ -1036,6 +1036,11 @@
 				}
 
 				ctx.sentSeq = ++state.seq;
+				if (config.failWhenOffline && typeof Ti !== 'undefined' && Ti.Network && Ti.Network.online === false) {
+					// Asked not to wait for a timeout when the device already knows it has no connection.
+					received(ctx, { status: 0, http: null, event: { error: 'The device is offline' }, elapsed: 0 });
+					return;
+				}
 				const log = logger();
 				if (log.enabled) {
 					log.log(method + ' ' + log.redactUrl(ctx.url) + (ctx.attempt > 1 ? ' (attempt ' + ctx.attempt + ')' : ''));
@@ -1860,8 +1865,11 @@
 		const VERSION = '2.0.0';
 
 		/** The members upstream 1.x defined on an instance: a method may not take one of these names. */
-		const RESERVED = ['config', 'setUrl', 'getUrl', 'clearCookies', 'setRequestHeaders', 'changeRequestHeader',
-			'removeRequestHeaderItem', 'addMethod', 'addModel', 'createModel', 'createCollection', 'modelConfig'];
+		const RESERVED = Object.create(null);
+		['config', 'setUrl', 'getUrl', 'clearCookies', 'setRequestHeaders', 'changeRequestHeader', 'removeRequestHeaderItem',
+			'addMethod', 'addModel', 'createModel', 'createCollection', 'modelConfig'].forEach((name) => {
+			RESERVED[name] = true;
+		});
 
 		const VERBS = ['post', 'get', 'put', 'patch', 'delete', 'head']; // upstream's order: the last one defined wins
 
@@ -2103,7 +2111,10 @@
 				}
 
 				reste.setRequestHeaders(config.requestHeaders);
-				(config.methods || []).forEach(method => reste.addMethod(method));
+				const methods = config.methods || [];
+				for (let i = 0; i < methods.length; i++) {
+					reste.addMethod(methods[i]);
+				}
 				(config.models || []).forEach(model => reste.addModel(model));
 				return reste;
 			};
@@ -2167,11 +2178,13 @@
 			// ------------------------------------------------------------------ methods
 
 			reste.addMethod = function (args) {
+				// Kept cheap: an app may define hundreds of methods at start and call a handful. The definition is
+				// only looked at when the method is first called.
 				const name = args.name;
-				if (records.has(name) || RESERVED.indexOf(name) !== -1) {
+				if (RESERVED[name] === true || records.has(name)) {
 					throw new Error('RESTe :: method already defined and will be overwritten: ' + name);
 				}
-				if (has(reste, name)) {
+				if (state.logger.enabled && has(reste, name)) {
 					state.logger.warn('method "' + name + '" hides RESTe\'s own ' + name + ' on this instance');
 				}
 				const record = { def: args, endpoint: null, variants: null, fn: null };
@@ -2355,6 +2368,14 @@
 				return data.modelFor(name, id);
 			};
 
+			/**
+			 * A list that follows a collection: an ordered, filtered, paginated selection of its models that picks
+			 * up models arriving any other way. See the README, "Lists that follow a collection".
+			 */
+			reste.list = function (options) {
+				return data.liveList(options);
+			};
+
 			reste.collections = data.collections;
 			reste.models = state.models;
 			reste.identity = data.identity;
@@ -2369,6 +2390,384 @@
 		Reste.fileStore = fileStore;
 
 		module.exports = Reste;
+	},
+	"./list": function (module, exports, require) {
+		const { createPager, readPage } = require('./pagination');
+		const { createAbortController, watchSignal } = require('./abort');
+		const { isFunction } = require('./util');
+
+		/**
+		 * A list that follows a collection.
+		 *
+		 * Apps often keep one collection per resource as the place where every model of that resource lives, and
+		 * show several lists of it: "open jobs", "my jobs", one conversation's messages. Such a list is an ordered
+		 * selection of the collection's models:
+		 *
+		 *   const open = api.list({
+		 *       collection: 'jobs',                                   // or the collection itself
+		 *       method: 'getJobs',                                    // default: the collection's read method
+		 *       query: { status: 'open' },                            // sent with every page
+		 *       filter: model => model.get('status') === 'open'       // which models of the collection belong
+		 *   });
+		 *   open.on('change', render);        // membership, order or a member's attributes changed: once per turn
+		 *   open.on('state', showSpinner);    // 'idle' | 'loading' | 'refreshing' | 'loadingMore' | 'error'
+		 *   open.load();                      // what the collection already holds at once, then the first page
+		 *   open.loadMore();  open.refresh();  open.retry();  open.reload({ query, filter });  open.destroy();
+		 *   open.models()                     // the models, in order
+		 *
+		 * Pages are merged into the collection (nothing is removed from it) and decide the order. A model that
+		 * reaches the collection another way (a socket event, an optimistic create, another list's page) joins the
+		 * list when it passes `filter`, at `place` ('start' or 'end'); one that stops passing it, or leaves the
+		 * collection, drops out. When a later page brings a model that had joined, it takes its place in the page.
+		 *
+		 * Cursor pagination adds loadOlder() (= loadMore) and loadNewer().
+		 *
+		 * deps: { Events, collection, pagination, content, request(query, signal) -> handle, merge(items) -> result }
+		 */
+		function createLiveList(deps, options) {
+			const collection = deps.collection;
+			const pagination = deps.pagination;
+			const cursor = Boolean(pagination && pagination.style === 'cursor');
+			const oldestFirst = cursor && pagination.order !== 'desc';
+			const place = options.place || (oldestFirst ? 'end' : 'start');
+			const schedule = isFunction(options.schedule) ? options.schedule : run => Promise.resolve().then(run);
+			const controller = createAbortController();
+
+			const list = Object.assign({}, deps.Events);
+			let filter = options.filter || (() => true);
+			let params = options.params;
+			let query = options.query;
+			let members = [];
+			let memberSet = new Set();
+			let joined = new Set(); // members that came from the collection, not from a page
+			let state = 'idle';
+			let error = null;
+			let loaded = false;
+			let failedMore = false;
+			let changeQueued = false;
+			let destroyed = false;
+			let generation = 0;
+			let single = null; // the request in flight of a list without pagination
+
+			const pager = pagination ? createPager(pagination, {
+				perPage: options.perPage,
+				limit: options.limit,
+				content: deps.content,
+				held: () => members
+			}, pageQuery => deps.request(params, Object.assign({}, query, pageQuery), controller.signal),
+			page => (page.unchanged ? null : mergePage(page.items))) : null;
+
+			// While one of this list's own pages is being merged into the collection, what the collection announces
+			// is held: the page decides where its models go, and only what came from elsewhere joins on its own.
+			let applying = 0;
+			let held = [];
+			let pageModels = new Set();
+
+			function mergePage(items) {
+				applying++;
+				const finish = (models) => {
+					models.forEach(model => pageModels.add(model));
+					if (--applying > 0) {
+						return;
+					}
+					const pending = held;
+					const fromPages = pageModels;
+					held = [];
+					pageModels = new Set();
+					pending.forEach((entry) => {
+						if (!fromPages.has(entry.model)) {
+							entry.handle(entry.model);
+						}
+					});
+				};
+				let result;
+				try {
+					result = deps.merge(items);
+				} catch (failure) {
+					finish([]);
+					throw failure;
+				}
+				return Promise.resolve(result).then((merged) => {
+					finish(merged.models);
+					return merged;
+				}, (failure) => {
+					finish([]);
+					throw failure;
+				});
+			}
+
+			function inCollection(model) {
+				if (model.id != null) {
+					return collection.get(model.id) === model;
+				}
+				return (isFunction(collection.getByCid) ? collection.getByCid(model.cid) : collection.get(model.cid)) === model;
+			}
+
+			function setMembers(next) {
+				members = next;
+				memberSet = new Set(next);
+			}
+
+			/** One "change" per turn however many models moved. */
+			function changed() {
+				if (changeQueued || destroyed) {
+					return;
+				}
+				changeQueued = true;
+				schedule(() => {
+					changeQueued = false;
+					if (!destroyed) {
+						list.trigger('change', list);
+					}
+				});
+			}
+
+			function setState(next, nextError) {
+				state = next;
+				error = nextError || null;
+				list.trigger('state', state, list);
+			}
+
+			function show(models, how) {
+				const unique = [];
+				const incoming = new Set();
+				models.forEach((model) => {
+					if (!incoming.has(model)) {
+						incoming.add(model);
+						unique.push(model);
+					}
+				});
+				if (how === 'replace') {
+					joined = new Set();
+					setMembers(unique);
+				} else {
+					// A page brings a model that had joined on its own: it takes its place in the page.
+					const kept = members.filter(model => !(joined.has(model) && incoming.has(model)));
+					unique.forEach(model => joined.delete(model));
+					const have = new Set(kept);
+					const fresh = unique.filter(model => !have.has(model));
+					setMembers(how === 'start' ? fresh.concat(kept) : kept.concat(fresh));
+				}
+				loaded = true;
+				changed();
+			}
+
+			function insert(model, settings) {
+				if (memberSet.has(model)) {
+					return;
+				}
+				const at = settings && settings.at != null ? settings.at : (place === 'start' ? 0 : members.length);
+				const next = members.slice();
+				next.splice(Math.max(0, Math.min(at, next.length)), 0, model);
+				setMembers(next);
+				joined.add(model);
+				changed();
+			}
+
+			function remove(target) {
+				const model = target && target.cid !== undefined ? target : members.find(member => member.id === target);
+				if (!model || !memberSet.has(model)) {
+					return;
+				}
+				setMembers(members.filter(member => member !== model));
+				joined.delete(model);
+				changed();
+			}
+
+			function onAdd(model) {
+				if (applying) {
+					held.push({ model, handle: onAdd });
+					return;
+				}
+				if (loaded && model && filter(model)) {
+					insert(model);
+				}
+			}
+
+			function onChange(model) {
+				if (!model || model.cid === undefined) {
+					return;
+				}
+				if (applying) {
+					held.push({ model, handle: onChange });
+					return;
+				}
+				const member = memberSet.has(model);
+				if (member && !filter(model)) {
+					remove(model);
+				} else if (!member && loaded && filter(model) && inCollection(model)) {
+					insert(model);
+				} else if (member) {
+					changed(); // a member's attributes: the screen updates that row
+				}
+			}
+
+			function onReset() {
+				setMembers(members.filter(inCollection));
+				changed();
+			}
+
+			/** RESTe's merges announce themselves once, with what they added, removed and changed. */
+			function onUpdate(target, details) {
+				const changes = details && details.changes;
+				if (!changes) {
+					return;
+				}
+				(changes.removed || []).forEach(remove);
+				(changes.added || []).forEach(onAdd);
+				(changes.merged || []).forEach(onChange);
+			}
+
+			collection.on('add', onAdd);
+			collection.on('remove', remove);
+			collection.on('reset', onReset);
+			collection.on('change', onChange);
+			collection.on('update', onUpdate);
+
+			function settle(promise, how, more) {
+				const mine = generation;
+				failedMore = false;
+				return promise.then((page) => {
+					if (destroyed || mine !== generation || page.discarded) {
+						return page;
+					}
+					if (page.response && !page.unchanged) {
+						show(page.models || [], how);
+						list.meta = page.meta;
+					} else if (!loaded) {
+						loaded = true;
+						changed();
+					}
+					setState('idle');
+					return page;
+				}, (failure) => {
+					if (destroyed || mine !== generation || (failure && failure.isCancelled)) {
+						return null;
+					}
+					failedMore = Boolean(more);
+					setState('error', failure);
+					list.trigger('error', failure, list);
+					return null;
+				});
+			}
+
+			function loadSingle() {
+				if (single) {
+					single.abort();
+				}
+				const handle = single = deps.request(params, Object.assign({}, query), controller.signal);
+				return handle.then((response) => {
+					const page = readPage({ style: 'page', items: null, meta: null }, response, null, deps.content);
+					page.response = response;
+					return mergePage(page.items).then(result => Object.assign(page, result));
+				});
+			}
+
+			function refresh() {
+				if (destroyed) {
+					return Promise.resolve(null);
+				}
+				setState(members.length ? 'refreshing' : 'loading');
+				return settle(pager ? pager.refresh() : loadSingle(), 'replace', false);
+			}
+
+			function loadMore() {
+				if (destroyed || !pager || !loaded || (state !== 'idle' && state !== 'error') || !pager.hasMore) {
+					return Promise.resolve(null);
+				}
+				setState('loadingMore');
+				return settle(pager.next(), oldestFirst ? 'start' : 'end', true);
+			}
+
+			function loadNewer() {
+				if (!cursor || !loaded) {
+					return refresh();
+				}
+				return settle(pager.previous(), oldestFirst ? 'end' : 'start', false);
+			}
+
+			function cached() {
+				return isFunction(options.cached) ? options.cached() : collection.filter(filter);
+			}
+
+			function destroy() {
+				if (destroyed) {
+					return;
+				}
+				destroyed = true;
+				controller.abort();
+				collection.off('add', onAdd);
+				collection.off('remove', remove);
+				collection.off('reset', onReset);
+				collection.off('change', onChange);
+				collection.off('update', onUpdate);
+				list.off();
+			}
+
+			if (options.signal) {
+				if (options.signal.aborted) {
+					destroy();
+				} else {
+					watchSignal(options.signal, destroy);
+				}
+			}
+
+			Object.defineProperties(list, {
+				state: { get: () => state },
+				error: { get: () => error },
+				loaded: { get: () => loaded },
+				/** True when the last failure was a further page: the rows stay, a retry row goes under them. */
+				failedMore: { get: () => state === 'error' && failedMore },
+				total: { get: () => (pager ? pager.total : null) },
+				length: { get: () => members.length }
+			});
+
+			return Object.assign(list, {
+				meta: null,
+				/** Shows what the collection already holds, then loads the first page. */
+				load() {
+					const initial = cached();
+					if (initial.length && !loaded) {
+						joined = new Set();
+						setMembers(initial.slice());
+						loaded = true;
+						changed();
+					}
+					return refresh();
+				},
+				refresh,
+				loadMore,
+				loadOlder: loadMore,
+				loadNewer,
+				/** After an error: what failed, again. */
+				retry() {
+					return failedMore ? loadMore() : refresh();
+				},
+				/** Other filters: forgets the pages and loads again, showing what the collection holds meanwhile. */
+				reload(next) {
+					const settings = next || {};
+					generation++;
+					filter = settings.filter || filter;
+					params = settings.params !== undefined ? settings.params : params;
+					query = settings.query !== undefined ? settings.query : query;
+					if (pager) {
+						pager.reset();
+					}
+					setMembers([]);
+					joined = new Set();
+					loaded = false;
+					return list.load();
+				},
+				insert,
+				remove,
+				models: () => members.slice(),
+				hasMore: () => (pager ? pager.hasMore : false),
+				isEmpty: () => loaded && members.length === 0 && state !== 'loading',
+				destroy
+			});
+		}
+
+		module.exports = { createLiveList };
 	},
 	"./logger": function (module, exports, require) {
 		const { isFunction, isObject, isBinary } = require('./util');
@@ -2548,11 +2947,22 @@
 				|| name === 'reset' || (typeof name === 'string' && name.indexOf('change:') === 0);
 		}
 
+		/** The record of what changed in one collection while events were held back. */
+		function touch(dirty, collection) {
+			let entry = dirty.get(collection);
+			if (!entry) {
+				entry = { added: new Set(), removed: new Set(), merged: new Set() };
+				dirty.set(collection, entry);
+			}
+			return entry;
+		}
+
 		/**
 		 * Merging API items into Backbone collections without rebuilding them. Works on every Backbone version Alloy
 		 * ships (0.9.2 has no Collection#set), so it does not use Backbone's own merge.
 		 *
-		 * `batch` is shared by all collections of one RESTe instance: { depth, dirty }.
+		 * `batch` is shared by all collections of one RESTe instance: { depth, dirty }, where dirty maps each
+		 * collection that held an event back to what changed in it.
 		 */
 		function createMerger(batch) {
 			/**
@@ -2568,7 +2978,8 @@
 				const replace = settings.mode === 'replace';
 				const coalesce = settings.events !== 'each';
 				const atStart = settings.position === 'start';
-				const job = { models: [], added: [], changed: [], removed: [], dirty: new Set(), insertAt: 0, reordered: false };
+				const job = { models: [], added: [], changed: [], removed: [], dirty: new Map(), insertAt: 0, reordered: false };
+				const receivedAt = Date.now();
 				const pending = new Map(); // id (or cid) -> model seen in this merge and not in the collection yet
 
 				function begin() {
@@ -2579,9 +2990,18 @@
 
 				function end() {
 					if (coalesce && --batch.depth === 0) {
-						batch.dirty.forEach(touched => job.dirty.add(touched));
+						carry(batch.dirty, job.dirty);
 						batch.dirty.clear();
 					}
+				}
+
+				function carry(from, to) {
+					from.forEach((entry, touched) => {
+						const target = touch(to, touched);
+						entry.added.forEach(model => target.added.add(model));
+						entry.removed.forEach(model => target.removed.add(model));
+						entry.merged.forEach(model => target.merged.add(model));
+					});
 				}
 
 				function find(id) {
@@ -2629,6 +3049,7 @@
 							if (identity && model.id != null && !identity.has(model.id)) {
 								identity.set(model.id, model);
 							}
+							model.receivedAt = receivedAt; // when the server last sent this model
 							job.models.push(model);
 							const key = model.id != null ? model.id : model.cid;
 							if (!pending.has(key) && !holds(collection, model)) {
@@ -2728,18 +3149,24 @@
 						return result;
 					}
 					if (touched) {
-						job.dirty.add(collection);
+						const own = touch(job.dirty, collection);
+						job.added.forEach(model => own.added.add(model));
+						job.removed.forEach(model => own.removed.add(model));
+						job.changed.forEach(model => own.merged.add(model));
 					}
 					if (batch.depth > 0) {
 						// Inside another merge: that one announces the change.
-						job.dirty.forEach(dirty => batch.dirty.add(dirty));
+						carry(job.dirty, batch.dirty);
 						return result;
 					}
+					// One "update" with what changed and one render event per collection that was touched: the one
+					// merged into, and any other that holds a model this merge changed.
 					const changeEvent = settings.changeEvent || 'fetch';
-					job.dirty.forEach((dirty) => {
-						if (dirty === collection) {
-							dirty.trigger('update', dirty, { changes: { added: job.added, removed: job.removed, merged: job.changed } });
-						}
+					job.dirty.forEach((entry, dirty) => {
+						dirty.trigger('update', dirty, {
+							reste: true,
+							changes: { added: Array.from(entry.added), removed: Array.from(entry.removed), merged: Array.from(entry.merged) }
+						});
 						dirty.trigger(changeEvent, dirty, { reste: true });
 					});
 					return result;
@@ -2769,14 +3196,16 @@
 							reject(error);
 						}
 					};
-					step();
+					// The first chunk waits a turn as well: the response was parsed just before this, and that is
+					// already the longest thing this request does in one go.
+					later(step, 0);
 				});
 			}
 
 			return { upsert };
 		}
 
-		module.exports = { createMerger, diffAttributes, isCoalesced };
+		module.exports = { createMerger, diffAttributes, isCoalesced, touch };
 	},
 	"./pagination": function (module, exports, require) {
 		const { ResteError } = require('./errors');
@@ -3236,7 +3665,8 @@
 	},
 	"./sync": function (module, exports, require) {
 		const { ResteError } = require('./errors');
-		const { createMerger, diffAttributes, isCoalesced } = require('./merge');
+		const { createMerger, diffAttributes, isCoalesced, touch } = require('./merge');
+		const { createLiveList } = require('./list');
 		const { normalizePagination, createPager, readPage } = require('./pagination');
 		const { isFunction, isObject, isPlainObject, has, noop, getPath, deepEqual, hashString } = require('./util');
 
@@ -3251,7 +3681,7 @@
 		 * other models in the app (SQLite, properties, another RESTe instance) are not affected.
 		 */
 		function createData(reste, state) {
-			const batch = { depth: 0, dirty: new Set() };
+			const batch = { depth: 0, dirty: new Map() };
 			const merger = createMerger(batch);
 			const records = Object.create(null); // model name -> { config, Model, idAttribute, mirrorId, identity }
 			const collections = Object.create(null); // collection name -> collection
@@ -3427,6 +3857,9 @@
 					if (method === 'delete' && record.identity && model.id != null) {
 						record.identity.delete(model.id);
 					}
+					if (method !== 'delete') {
+						model.receivedAt = Date.now();
+					}
 					if (isFunction(settings.success)) {
 						settings.success(data);
 					}
@@ -3509,6 +3942,88 @@
 				return Base.prototype.save.call(model, attrs, settings);
 			}
 
+			function optimisticChange(model, changes, send) {
+				const previous = {};
+				Object.keys(changes).forEach((name) => {
+					previous[name] = model.has(name) ? model.get(name) : undefined;
+				});
+				model.set(changes);
+				const result = Promise.resolve().then(send).then((resource) => {
+					if (isPlainObject(resource)) {
+						const diff = diffAttributes(model.attributes, resource);
+						if (diff) {
+							model.set(diff);
+						}
+						model.receivedAt = Date.now();
+					}
+					return model;
+				}, (error) => {
+					Object.keys(changes).forEach((name) => {
+						if (deepEqual(model.get(name), changes[name])) {
+							if (previous[name] === undefined) {
+								model.unset(name);
+							} else {
+								model.set(name, previous[name]);
+							}
+						}
+					});
+					model.trigger('rollback', model, error, {});
+					throw error;
+				});
+				return result;
+			}
+
+			/**
+			 * collection.optimistic(attributes, send): the model is in the list now; when `send()` resolves the
+			 * server's resource it takes those attributes (and the real id) in place, and when it fails the model is
+			 * taken out again. If the server's copy got into the collection first (a socket event beat the response),
+			 * that one is kept and the temporary model is dropped.
+			 */
+			function optimisticAdd(meta, collection, attributes, send, options) {
+				const record = meta.record;
+				const model = new record.Model(mirrored(record, attributes));
+				collection.add(model, options);
+				meta.mutations++;
+				return Promise.resolve().then(send).then((resource) => {
+					if (isPlainObject(resource)) {
+						return settleCreated(meta, collection, model, mirrored(record, resource));
+					}
+					return model;
+				}, (error) => {
+					collection.remove(model);
+					model.trigger('rollback', model, error, {});
+					throw error;
+				});
+			}
+
+			/** Gives a model created on the client its server attributes, or folds it into the copy that already arrived. */
+			function settleCreated(meta, collection, model, resource) {
+				const record = meta.record;
+				const id = resource[record.idAttribute];
+				const existing = id != null && id !== model.id ? collection.get(id) || (record.identity ? record.identity.get(id) : null) : null;
+				if (existing && existing !== model) {
+					collection.remove(model);
+					const diff = diffAttributes(existing.attributes, resource);
+					if (diff) {
+						existing.set(diff);
+					}
+					if (collection.get(id) !== existing) {
+						collection.add(existing);
+					}
+					existing.receivedAt = Date.now();
+					return existing;
+				}
+				const diff = diffAttributes(model.attributes, resource);
+				if (diff) {
+					model.set(diff);
+				}
+				model.receivedAt = Date.now();
+				if (record.identity && model.id != null) {
+					record.identity.set(model.id, model);
+				}
+				return model;
+			}
+
 			/** destroy({ optimistic: true }): removed at once, put back where it was if the server refuses. */
 			function optimisticDestroy(Base, model, options) {
 				const settings = options ? Object.assign({}, options) : {};
@@ -3571,6 +4086,14 @@
 					},
 					destroy(options) {
 						return optimisticDestroy(Base, this, options);
+					},
+					/**
+					 * An optimistic change whose request is not the model's own save: the attributes change now,
+					 * `send()` (a function returning a promise) runs, and they are put back if it fails. When it
+					 * resolves an object, that is merged in as the server's answer.
+					 */
+					optimistic(changes, send) {
+						return optimisticChange(this, changes, send);
 					},
 					/** Makes the model hold exactly `attributes`: keys they lack are removed; only real changes fire. */
 					replace(attributes) {
@@ -3684,6 +4207,7 @@
 					// What the collection held after its last refresh, to recognise "nothing changed" cheaply.
 					mutations: 0, cleanAt: -1, lastUrl: null, lastEtag: null, lastHash: null, lastLength: -1
 				};
+				collection._reste = meta;
 				collection._type = record.config.name;
 				collection._name = config.name;
 				collection.model = record.Model;
@@ -3699,7 +4223,18 @@
 						meta.mutations++;
 					}
 					if (batch.depth > 0 && isCoalesced(name)) {
-						batch.dirty.add(this);
+						// Held back while a merge runs; the merge announces everything once at its end.
+						const entry = touch(batch.dirty, this);
+						const model = arguments[1];
+						if (model && model.cid !== undefined) {
+							if (name === 'change') {
+								entry.merged.add(model);
+							} else if (name === 'add') {
+								entry.added.add(model);
+							} else if (name === 'remove') {
+								entry.removed.add(model);
+							}
+						}
 						return this;
 					}
 					return Base.trigger.apply(this, arguments);
@@ -3743,6 +4278,10 @@
 						settings.position || 'end'));
 				};
 
+				collection.optimistic = function (attributes, send, options) {
+					return optimisticAdd(meta, this, attributes, send, options);
+				};
+
 				/** create(attrs, { optimistic: true }): shown at once, taken out again if the server refuses it. */
 				collection.create = function (attributes, options) {
 					const settings = options ? Object.assign({}, options) : {};
@@ -3763,6 +4302,19 @@
 							userError.apply(this, arguments);
 						} else if (created && isLegacy()) {
 							created.trigger('error', created, failure, settings);
+						}
+					};
+					const userSuccess = settings.success;
+					settings.success = function () {
+						// The server's copy may have reached the collection first (a socket event): keep one row.
+						if (created && created.id != null) {
+							const twin = self.models.find(other => other !== created && other.id === created.id);
+							if (twin) {
+								self.remove(twin);
+							}
+						}
+						if (isFunction(userSuccess)) {
+							userSuccess.apply(this, arguments);
 						}
 					};
 					delete settings.optimistic; // the model's own save must not try to roll attributes back
@@ -3932,6 +4484,7 @@
 				}
 				const generation = state.generation;
 				const replace = direction === 'refresh';
+				const skipUnchanged = (settings.skipUnchanged !== undefined ? settings.skipUnchanged : config.skipUnchanged) !== false;
 				const done = (page) => {
 					const body = page.response ? page.response.body : null;
 					if (isFunction(settings.success)) {
@@ -3945,7 +4498,7 @@
 				const isClean = url => meta.cleanAt === meta.mutations && meta.lastUrl === url && collection.length > 0;
 				const requestOptions = () => {
 					const options = callOptions(settings);
-					if (replace && config.skipUnchanged !== false && meta.lastHash !== null && meta.cleanAt === meta.mutations && collection.length > 0) {
+					if (replace && skipUnchanged && meta.lastHash !== null && meta.cleanAt === meta.mutations && collection.length > 0) {
 						// Lets the request skip parsing when the server sends the same bytes again.
 						options.unchangedIf = { url: meta.lastUrl, length: meta.lastLength, hash: meta.lastHash };
 					}
@@ -3962,7 +4515,7 @@
 					if (page.unchanged) {
 						return unchanged(); // the same bytes as the last refresh, and nothing touched the collection since
 					}
-					if (replace && config.skipUnchanged !== false) {
+					if (replace && skipUnchanged) {
 						const etag = response.header('ETag');
 						if (response.fromCache) {
 							// A cache hit or a 304 for the representation this collection was last refreshed from.
@@ -4037,6 +4590,41 @@
 				}), () => (requestHandle && requestHandle.abort ? requestHandle.abort() : false));
 			}
 
+			/** api.list(): a list that follows one of the collections (see list.js). */
+			function liveList(options) {
+				const settings = options || {};
+				const collection = typeof settings.collection === 'string' ? collections[settings.collection] : settings.collection;
+				const meta = collection && collection._reste;
+				if (!meta) {
+					throw new Error('RESTe :: list() needs a collection from the models config');
+				}
+				const method = settings.method || meta.config.read;
+				if (!method || !state.hasMethod(method)) {
+					throw new Error('RESTe :: list() has no method to load from' + (method ? ' (' + method + ' is not defined)' : ''));
+				}
+				const endpoint = state.endpointOf(method);
+				const pagination = normalizePagination(settings.paginate !== undefined ? settings.paginate : meta.config.paginate,
+					endpoint ? endpoint.paginate : state.pagination);
+				return createLiveList({
+					Events: backbone().Events,
+					collection,
+					pagination,
+					content: settings.content !== undefined ? settings.content : meta.config.content,
+					request(params, query, signal) {
+						const all = Object.assign({}, meta.config.params, isFunction(params) ? params() : params);
+						const merged = Object.assign({}, meta.config.query, isFunction(query) ? query() : query);
+						if (Object.keys(merged).length) {
+							all.query = merged;
+						}
+						return state.call(method, all, Object.assign({}, settings.request, { fullResponse: true, signal }));
+					},
+					merge(items) {
+						meta.mutations++;
+						return merger.upsert(collection, items, mergeSettings(meta, settings, 'merge', 'end'));
+					}
+				}, settings);
+			}
+
 			function reset(options) {
 				Object.keys(records).forEach((name) => {
 					if (records[name].identity) {
@@ -4065,6 +4653,7 @@
 				createModel,
 				modelFor,
 				createCollection,
+				liveList,
 				collections,
 				records,
 				merger,
