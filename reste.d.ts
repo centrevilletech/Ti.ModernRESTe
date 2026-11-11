@@ -191,6 +191,19 @@ declare namespace Reste {
 		shouldRetry?: (error: ResteError, attempt: number, request: { method: string; idempotencyKey: string | null; name: string }) => boolean | void;
 	}
 
+	/** Sends a method the platform cannot send with its body as POST, the real method in a header. */
+	interface MethodOverride {
+		/** Default 'X-HTTP-Method-Override'. */
+		header?: string;
+		/** The methods it applies to. Default ['DELETE']. */
+		methods?: string[];
+		/**
+		 * false (default): only where the platform's HTTP client drops the body, for a request that has one
+		 * (DELETE on Android). true: every request of those methods, on every platform.
+		 */
+		always?: boolean;
+	}
+
 	interface CachePolicy {
 		/** Milliseconds a response stays fresh, whatever the server says. Default: follow Cache-Control max-age. */
 		ttl?: number | null;
@@ -401,6 +414,8 @@ declare namespace Reste {
 		session?: boolean;
 		/** false: `onStatus` hooks do not fire for this method. */
 		statusHooks?: boolean;
+		/** Overrides the instance's `methodOverride` for this method. */
+		methodOverride?: boolean | MethodOverride;
 		interceptors?: Interceptors;
 		mapError?: (error: ResteError | Error, request: RequestInfo) => any;
 		onLoad?: (data: any, callback: (data: any) => void, response?: Response) => void;
@@ -549,6 +564,11 @@ declare namespace Reste {
 		pagination?: Pagination;
 		/** Reject at once, without sending, when Ti.Network.online is false. */
 		failWhenOffline?: boolean;
+		/**
+		 * Off by default. Sends a request the platform cannot send with its body (a DELETE on Android) as POST
+		 * with the real method in a header. The server has to honour that header.
+		 */
+		methodOverride?: boolean | MethodOverride;
 		/** The smallest change in upload or download progress that is reported. Default 0.01. */
 		progressStep?: number;
 

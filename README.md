@@ -195,6 +195,7 @@ Callbacks receive `(data, response)`.
 | `dedupe` | `false` | identical GETs in flight share one request |
 | `pagination` | | defaults for paginated methods |
 | `failWhenOffline` | `false` | reject at once when `Ti.Network.online` is false |
+| `methodOverride` | off | send a method the platform cannot send with its body as POST plus a header, see [Method override](#method-override) |
 | `progressStep` | `0.01` | smallest change in upload / download progress that is reported |
 | `query` | | `{ arrayFormat: 'brackets' \| 'repeat' \| 'indices' \| 'comma', nulls: 'skip' \| 'empty', skipEmptyString }` |
 | `querySerializer` | | `query => string`, replaces the built-in serializer |
@@ -250,6 +251,7 @@ Static members: `Reste.ResteError`, `Reste.createAbortController()`,
 | `unwrap`, `meta`, `fullResponse` | per method; `unwrap: false` switches the envelope off |
 | `paginate` | `'page'`, `'cursor'` or a config, see [Pagination](#pagination) |
 | `session: false` | the request survives a session reset (sign-in, public configuration) |
+| `methodOverride` | `true`, `false` or a policy for this method, see [Method override](#method-override) |
 | `statusHooks: false` | `onStatus` hooks do not fire for this method (a wrong password is not an expired session) |
 | `mapError`, `interceptors` | per method |
 | `onLoad`, `onError`, `beforeSend`, `beforePost` | the 1.x hooks, per method |
@@ -596,9 +598,36 @@ Platform notes, measured on SDK 13.4.1: Android reports upload progress every
 few hundred bytes (6145 events for 3 MB), iOS a handful of times; RESTe passes
 progress on in steps of `progressStep` (1 %). Android does not keep the order
 of multipart fields. Android's HTTP client sends `DELETE` without its body
-(iOS sends it): put such data in the URL. A boolean in a flat form body is
+(iOS sends it): put such data in the URL, or see
+[Method override](#method-override). A boolean in a flat form body is
 written by the platform, as in 1.x: `true` on Android, `1` on iOS; pass a
 string to decide yourself.
+
+## Method override
+
+Titanium's Android HTTP client sends a `DELETE` without its body. When an
+endpoint needs that body (a password to confirm the deletion, say) and the
+server understands a method override, RESTe can send the request as `POST`
+with the real method in a header:
+
+```javascript
+api.config({ methodOverride: true });                       // X-HTTP-Method-Override: DELETE
+api.config({ methodOverride: { header: 'X-HTTP-Method', methods: ['DELETE', 'PATCH'], always: true } });
+{ name: 'closeAccount', delete: 'account', methodOverride: true }    // or per method; false opts one out
+```
+
+| Key | Default | |
+| --- | --- | --- |
+| `header` | `X-HTTP-Method-Override` | the header that carries the method |
+| `methods` | `['DELETE']` | the methods it applies to |
+| `always` | `false` | `false`: only where the platform would drop the body, and only for a request that has one (today: `DELETE` on Android). `true`: every request of those methods on every platform, for a network that lets only `GET` and `POST` through |
+
+It is off by default because the server has to take part: check that yours
+honours the header (many frameworks do, some only once it is switched on)
+before turning this on. Only the wire changes. For retries, status hooks,
+interceptors, the log and errors the request is still the `DELETE` it was
+asked to be: an override never makes it repeatable. Without the option, RESTe
+warns once on Android when a `DELETE` is given a body.
 
 ## Pagination
 
@@ -1131,9 +1160,9 @@ The example app prints the same measurements on a device (`RESTE-BENCH` lines).
 Verified by running, not only by unit tests:
 
 - **Node**: `npm test` runs the suite against the sources and against the
-  built `reste.js`: 829 tests each time. Many of them are the same test
+  built `reste.js`: 834 tests each time. Many of them are the same test
   repeated on each Backbone version Alloy ships (0.9.2, 1.1.2, 1.3.3, 1.4.0,
-  1.6.0); there are 391 distinct tests. They cover the request pipeline on a
+  1.6.0); there are 396 distinct tests. They cover the request pipeline on a
   scripted HTTP client, models and collections, an integration suite over real
   sockets against `test/server/server.js`, and 62 scenarios from upstream's
   README run against upstream and this build side by side.

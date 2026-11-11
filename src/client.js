@@ -5,7 +5,7 @@ const { fillTemplate, serializeQuery, withQuery, joinUrl, flattenFields, hasBina
 const { shouldRetry, retryDelay } = require('./retry');
 const { watchSignal } = require('./abort');
 const transport = require('./transport');
-const { isFunction, isObject, has, noop, now, getPath, headerKey, hashString, later } = require('./util');
+const { isFunction, isObject, isPlainObject, has, noop, now, getPath, headerKey, hashString, later } = require('./util');
 
 const EMPTY = Object.freeze({});
 const ORIGIN = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]+/i;
@@ -89,6 +89,15 @@ function parseBody(text, http) {
 	}
 }
 
+/** Titanium's Android HTTP client sends a DELETE without its body (verified on SDK 13.4.1); iOS sends it. */
+function dropsBody(method) {
+	return method === 'DELETE' && typeof Ti !== 'undefined' && Boolean(Ti.Platform) && Ti.Platform.osname === 'android';
+}
+
+function hasBody(body) {
+	return body !== undefined && body !== null && body !== '' && !(isPlainObject(body) && Object.keys(body).length === 0);
+}
+
 function toResteError(error) {
 	if (error instanceof Error) {
 		return error; // a ResteError, or the app's own error thrown by an interceptor: passed on untouched
@@ -136,6 +145,7 @@ function createPipeline(state) {
 			unwatch: null,
 			shared: null,
 			answered: false,
+			overriding: false,
 			elapsed: 0,
 			lead: true,
 			retryPolicy: undefined,
@@ -574,6 +584,18 @@ function createPipeline(state) {
 		return false;
 	}
 
+	/**
+	 * The header that carries the real method when this request has to travel as POST (`methodOverride`), or
+	 * null: where the platform's HTTP client would drop the body, or everywhere when the policy says `always`.
+	 */
+	function overrideHeader(ctx) {
+		const policy = ctx.endpoint.methodOverride;
+		if (!policy || policy.methods.indexOf(ctx.method) === -1) {
+			return null;
+		}
+		return policy.always || (dropsBody(ctx.method) && hasBody(ctx.body)) ? policy.header : null;
+	}
+
 	function encodeBody(ctx, headers) {
 		const endpoint = ctx.endpoint;
 		let body = ctx.body;
@@ -597,12 +619,11 @@ function createPipeline(state) {
 				return undefined;
 			}
 			body = {}; // upstream always sent a JSON body with POST, PUT and PATCH
-		} else if (ctx.method === 'DELETE' && !state.warnedDeleteBody && typeof Ti !== 'undefined' && Ti.Platform
-			&& Ti.Platform.osname === 'android') {
+		} else if (!ctx.overriding && !state.warnedDeleteBody && dropsBody(ctx.method)) {
 			// Verified on Titanium SDK 13.4.1: the Android HTTP client sends DELETE without its body.
 			state.warnedDeleteBody = true;
 			logger().always(endpoint.name + ' sends a body with DELETE: Titanium\'s Android HTTP client drops it (iOS sends it). '
-				+ 'Put the data in the URL, or use POST.');
+				+ 'Put the data in the URL, use POST, or set methodOverride.');
 		}
 		if (typeof body === 'string') {
 			return body;
@@ -645,7 +666,14 @@ function createPipeline(state) {
 		const method = ctx.method;
 		let request;
 		try {
+			// A method this platform cannot send with its body goes out as POST and names itself in a header.
+			// Only the wire sees that: retries, hooks, the log and errors keep the method that was asked for.
+			const override = overrideHeader(ctx);
+			ctx.overriding = Boolean(override);
 			const payload = method === 'GET' || method === 'HEAD' ? undefined : encodeBody(ctx, headers);
+			if (override) {
+				headers[override] = method;
+			}
 			if (ctx.cacheEntry) {
 				if (ctx.cacheEntry.etag) {
 					headers['If-None-Match'] = ctx.cacheEntry.etag;
@@ -661,7 +689,7 @@ function createPipeline(state) {
 			const progress = options.onProgress;
 			const upload = method !== 'GET' && method !== 'HEAD';
 			request = {
-				method,
+				method: override ? 'POST' : method,
 				url: ctx.url,
 				headers,
 				payload,

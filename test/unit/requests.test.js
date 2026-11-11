@@ -440,3 +440,89 @@ describe('configuration', () => {
 		await wait();
 	});
 });
+
+describe('method override', () => {
+	// Titanium's Android HTTP client sends a DELETE without its body; the other platforms send it.
+	const on = (osname) => {
+		global.Ti.Platform.osname = osname;
+	};
+
+	it('is off unless configured: the request goes out as it is, and Android is told once that the body is lost', async () => {
+		const warnings = [];
+		const { api } = make({ logger: (level, message) => warnings.push(message) });
+		on('android');
+		await api.deleteVideo({ id: 1, body: { reason: 'x' } });
+		await api.deleteVideo({ id: 2, body: { reason: 'y' } });
+		assert.deepEqual(ti.requests.map(request => request.method), ['DELETE', 'DELETE']);
+		assert.equal(ti.last.headers['X-HTTP-Method-Override'], undefined);
+		assert.equal(warnings.filter(message => /drops it/.test(message)).length, 1);
+	});
+
+	it('sends a DELETE that has a body as POST with the real method in a header, where the platform would drop the body', async () => {
+		const warnings = [];
+		const events = [];
+		const { api } = make({
+			methodOverride: true, debug: true,
+			logger: (level, message, details) => (details && details.event ? events.push(details.method) : warnings.push(message))
+		});
+		on('android');
+		const response = await api.deleteVideo({ id: 1, body: { reason: 'x' } }, { fullResponse: true });
+		assert.equal(ti.last.method, 'POST');
+		assert.equal(ti.last.url, 'https://api.test/v1/videos/1');
+		assert.equal(ti.last.headers['X-HTTP-Method-Override'], 'DELETE');
+		assert.deepEqual(ti.last.json, { reason: 'x' });
+		assert.equal(ti.last.headers['Content-Type'], 'application/json');
+		// For the app it is the DELETE it asked for: the response, the log, interceptors and errors say so.
+		assert.equal(response.method, 'DELETE');
+		assert.deepEqual(events, ['DELETE', 'DELETE']);
+		assert.deepEqual(warnings, []); // nothing is lost any more: no warning
+	});
+
+	it('leaves alone a DELETE without a body, the other methods, and a platform that sends the body', async () => {
+		const { api } = make({ methodOverride: true });
+		on('android');
+		await api.deleteVideo({ id: 1 });
+		await api.deleteVideo({ id: 1, body: {} });
+		await api.putVideo({ id: 1, body: { a: 1 } });
+		on('iphone');
+		await api.deleteVideo({ id: 1, body: { reason: 'x' } });
+		assert.deepEqual(ti.requests.map(request => request.method), ['DELETE', 'DELETE', 'PUT', 'DELETE']);
+		ti.requests.forEach(request => assert.equal(request.headers['X-HTTP-Method-Override'], undefined));
+		assert.deepEqual(ti.last.json, { reason: 'x' });
+	});
+
+	it('takes another header and other methods, can apply everywhere, and a method can decide for itself', async () => {
+		const { api } = make({
+			methodOverride: { header: 'X-Method', methods: ['DELETE', 'PATCH'], always: true },
+			methods: METHODS.concat([{ name: 'plain', delete: 'plain/<id>', methodOverride: false }])
+		});
+		on('iphone');
+		await api.patchVideo({ id: 1, body: { a: 1 } });
+		await api.deleteVideo({ id: 1 });
+		await api.plain({ id: 1, body: { a: 1 } });
+		await api.putVideo({ id: 1, body: { a: 1 } });
+		assert.deepEqual(ti.requests.map(request => [request.method, request.headers['X-Method']]),
+			[['POST', 'PATCH'], ['POST', 'DELETE'], ['DELETE', undefined], ['PUT', undefined]]);
+		ti.uninstall();
+		const own = make({ methods: [{ name: 'remove', delete: 'things/<id>', methodOverride: true }, { name: 'other', delete: 'others/<id>' }] });
+		on('android');
+		await own.api.remove({ id: 1, body: { a: 1 } });
+		await own.api.other({ id: 1, body: { a: 1 } });
+		assert.deepEqual(ti.requests.map(request => [request.method, request.headers['X-HTTP-Method-Override']]), [['POST', 'DELETE'], ['DELETE', undefined]]);
+	});
+
+	it('does not make the request repeatable: it is still the DELETE it was, in the retry rules and in the error', async () => {
+		const { api } = make({ methodOverride: true, retry: { retries: 2, baseDelay: 1, jitter: 0 } });
+		on('android');
+		ti.respond(() => ({ error: 'timeout' }));
+		const error = await rejection(api.deleteVideo({ id: 1, body: { reason: 'x' } }));
+		assert.equal(ti.requests.length, 1);
+		assert.equal(error.kind, 'timeout');
+		assert.equal(error.method, 'DELETE');
+		// ... and one that is repeatable is repeated the same way.
+		ti.respond(() => ({ status: 503 }));
+		await rejection(api.deleteVideo({ id: 1, body: { reason: 'x' } }, { idempotencyKey: 'k' }));
+		assert.deepEqual(ti.requests.slice(1).map(request => [request.method, request.headers['X-HTTP-Method-Override']]),
+			[['POST', 'DELETE'], ['POST', 'DELETE'], ['POST', 'DELETE']]);
+	});
+});

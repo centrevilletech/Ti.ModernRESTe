@@ -23,6 +23,23 @@ const RESERVED = Object.create(null);
 
 const VERBS = ['post', 'get', 'put', 'patch', 'delete', 'head']; // upstream's order: the last one defined wins
 
+const OVERRIDE_DEFAULTS = { header: 'X-HTTP-Method-Override', methods: ['DELETE'], always: false };
+
+/**
+ * `methodOverride`: true, false or { header, methods, always } -> the policy, layered over `base`; null when off.
+ */
+function normalizeOverride(value, base) {
+	if (value === false) {
+		return null;
+	}
+	if (value === undefined || value === null) {
+		return base || null;
+	}
+	const policy = Object.assign({}, OVERRIDE_DEFAULTS, base, isPlainObject(value) ? value : null);
+	policy.methods = [].concat(policy.methods || []).map(method => String(method).toUpperCase());
+	return policy;
+}
+
 /** How many compiled URLs a method whose URL is a function keeps. */
 const MAX_VARIANTS = 32;
 
@@ -42,6 +59,7 @@ function Reste() {
 		cacheDefaults: null,
 		cacheScope: null,
 		authStatuses: [401],
+		methodOverride: null,
 		pagination: null,
 		cache: createCache({}),
 		keys: createKeys(uuid),
@@ -125,6 +143,7 @@ function Reste() {
 			paginate: normalizePagination(def.paginate, state.pagination),
 			fullResponse: def.fullResponse,
 			session: def.session,
+			methodOverride: normalizeOverride(def.methodOverride, state.methodOverride),
 			statusHooks: def.statusHooks,
 			interceptors: def.interceptors || null,
 			redact: def.redact ? [].concat(def.redact) : null,
@@ -264,6 +283,7 @@ function Reste() {
 		state.cache = createCache({ maxEntries: cache.maxEntries, store: cache.store, prefix: cache.prefix });
 		state.cacheScope = cache.scope === undefined ? null : cache.scope;
 		state.authStatuses = Array.isArray(config.authStatuses) ? config.authStatuses.map(Number) : [401];
+		state.methodOverride = normalizeOverride(config.methodOverride, null);
 
 		state.interceptors = { request: [], response: [], error: [] };
 		if (config.interceptors) {

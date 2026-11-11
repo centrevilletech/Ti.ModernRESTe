@@ -602,7 +602,7 @@
 		const { shouldRetry, retryDelay } = require('./retry');
 		const { watchSignal } = require('./abort');
 		const transport = require('./transport');
-		const { isFunction, isObject, has, noop, now, getPath, headerKey, hashString, later } = require('./util');
+		const { isFunction, isObject, isPlainObject, has, noop, now, getPath, headerKey, hashString, later } = require('./util');
 
 		const EMPTY = Object.freeze({});
 		const ORIGIN = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]+/i;
@@ -686,6 +686,15 @@
 			}
 		}
 
+		/** Titanium's Android HTTP client sends a DELETE without its body (verified on SDK 13.4.1); iOS sends it. */
+		function dropsBody(method) {
+			return method === 'DELETE' && typeof Ti !== 'undefined' && Boolean(Ti.Platform) && Ti.Platform.osname === 'android';
+		}
+
+		function hasBody(body) {
+			return body !== undefined && body !== null && body !== '' && !(isPlainObject(body) && Object.keys(body).length === 0);
+		}
+
 		function toResteError(error) {
 			if (error instanceof Error) {
 				return error; // a ResteError, or the app's own error thrown by an interceptor: passed on untouched
@@ -733,6 +742,7 @@
 					unwatch: null,
 					shared: null,
 					answered: false,
+					overriding: false,
 					elapsed: 0,
 					lead: true,
 					retryPolicy: undefined,
@@ -1171,6 +1181,18 @@
 				return false;
 			}
 
+			/**
+			 * The header that carries the real method when this request has to travel as POST (`methodOverride`), or
+			 * null: where the platform's HTTP client would drop the body, or everywhere when the policy says `always`.
+			 */
+			function overrideHeader(ctx) {
+				const policy = ctx.endpoint.methodOverride;
+				if (!policy || policy.methods.indexOf(ctx.method) === -1) {
+					return null;
+				}
+				return policy.always || (dropsBody(ctx.method) && hasBody(ctx.body)) ? policy.header : null;
+			}
+
 			function encodeBody(ctx, headers) {
 				const endpoint = ctx.endpoint;
 				let body = ctx.body;
@@ -1194,12 +1216,11 @@
 						return undefined;
 					}
 					body = {}; // upstream always sent a JSON body with POST, PUT and PATCH
-				} else if (ctx.method === 'DELETE' && !state.warnedDeleteBody && typeof Ti !== 'undefined' && Ti.Platform
-					&& Ti.Platform.osname === 'android') {
+				} else if (!ctx.overriding && !state.warnedDeleteBody && dropsBody(ctx.method)) {
 					// Verified on Titanium SDK 13.4.1: the Android HTTP client sends DELETE without its body.
 					state.warnedDeleteBody = true;
 					logger().always(endpoint.name + ' sends a body with DELETE: Titanium\'s Android HTTP client drops it (iOS sends it). '
-						+ 'Put the data in the URL, or use POST.');
+						+ 'Put the data in the URL, use POST, or set methodOverride.');
 				}
 				if (typeof body === 'string') {
 					return body;
@@ -1242,7 +1263,14 @@
 				const method = ctx.method;
 				let request;
 				try {
+					// A method this platform cannot send with its body goes out as POST and names itself in a header.
+					// Only the wire sees that: retries, hooks, the log and errors keep the method that was asked for.
+					const override = overrideHeader(ctx);
+					ctx.overriding = Boolean(override);
 					const payload = method === 'GET' || method === 'HEAD' ? undefined : encodeBody(ctx, headers);
+					if (override) {
+						headers[override] = method;
+					}
 					if (ctx.cacheEntry) {
 						if (ctx.cacheEntry.etag) {
 							headers['If-None-Match'] = ctx.cacheEntry.etag;
@@ -1258,7 +1286,7 @@
 					const progress = options.onProgress;
 					const upload = method !== 'GET' && method !== 'HEAD';
 					request = {
-						method,
+						method: override ? 'POST' : method,
 						url: ctx.url,
 						headers,
 						payload,
@@ -2253,6 +2281,23 @@
 
 		const VERBS = ['post', 'get', 'put', 'patch', 'delete', 'head']; // upstream's order: the last one defined wins
 
+		const OVERRIDE_DEFAULTS = { header: 'X-HTTP-Method-Override', methods: ['DELETE'], always: false };
+
+		/**
+		 * `methodOverride`: true, false or { header, methods, always } -> the policy, layered over `base`; null when off.
+		 */
+		function normalizeOverride(value, base) {
+			if (value === false) {
+				return null;
+			}
+			if (value === undefined || value === null) {
+				return base || null;
+			}
+			const policy = Object.assign({}, OVERRIDE_DEFAULTS, base, isPlainObject(value) ? value : null);
+			policy.methods = [].concat(policy.methods || []).map(method => String(method).toUpperCase());
+			return policy;
+		}
+
 		/** How many compiled URLs a method whose URL is a function keeps. */
 		const MAX_VARIANTS = 32;
 
@@ -2272,6 +2317,7 @@
 				cacheDefaults: null,
 				cacheScope: null,
 				authStatuses: [401],
+				methodOverride: null,
 				pagination: null,
 				cache: createCache({}),
 				keys: createKeys(uuid),
@@ -2355,6 +2401,7 @@
 					paginate: normalizePagination(def.paginate, state.pagination),
 					fullResponse: def.fullResponse,
 					session: def.session,
+					methodOverride: normalizeOverride(def.methodOverride, state.methodOverride),
 					statusHooks: def.statusHooks,
 					interceptors: def.interceptors || null,
 					redact: def.redact ? [].concat(def.redact) : null,
@@ -2494,6 +2541,7 @@
 				state.cache = createCache({ maxEntries: cache.maxEntries, store: cache.store, prefix: cache.prefix });
 				state.cacheScope = cache.scope === undefined ? null : cache.scope;
 				state.authStatuses = Array.isArray(config.authStatuses) ? config.authStatuses.map(Number) : [401];
+				state.methodOverride = normalizeOverride(config.methodOverride, null);
 
 				state.interceptors = { request: [], response: [], error: [] };
 				if (config.interceptors) {

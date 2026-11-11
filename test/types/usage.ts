@@ -101,6 +101,8 @@ async function run(): Promise<void> {
 	api.optimistic(own, { id: 'tmp' }, () => Promise.resolve({ id: 2 })).then(model => console.log(model, merged, replaced));
 	api.config({ logger: (level, message, details: Reste.LogEvent) => console.log(level, message, details && details.event === 'response' ? details.elapsed : 0) });
 
+	api.config({ methodOverride: { header: 'X-HTTP-Method-Override', methods: ['DELETE'], always: false }, methods: [{ name: 'closeAccount', delete: 'account', methodOverride: true }] });
+
 	api.session.reset({ resetCollections: true });
 	api.cache.invalidate('getTodo', { id: 1 });
 	const remove = api.use({ response: response => response });

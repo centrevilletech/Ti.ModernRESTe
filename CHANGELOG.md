@@ -4,6 +4,12 @@
 
 ### Added
 
+- `methodOverride` (per instance or per method, off by default): a request
+  the platform cannot send with its body, a `DELETE` on Android, goes out as
+  `POST` with the real method in `X-HTTP-Method-Override` (the header, the
+  methods and "on every platform" are configurable). Retries, hooks, the log
+  and errors still see the method that was asked for
+
 - `api.list({ collection, load })`: a list whose pages come from a function
   of the app (a service call) instead of a method, over RESTe's collections
   or any Backbone collection
