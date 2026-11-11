@@ -1131,13 +1131,13 @@ The example app prints the same measurements on a device (`RESTE-BENCH` lines).
 Verified by running, not only by unit tests:
 
 - **Node**: `npm test` runs the suite against the sources and against the
-  built `reste.js`: 780 tests each time. Many of them are the same test
+  built `reste.js`: 829 tests each time. Many of them are the same test
   repeated on each Backbone version Alloy ships (0.9.2, 1.1.2, 1.3.3, 1.4.0,
-  1.6.0); there are 378 distinct tests. They cover the request pipeline on a
+  1.6.0); there are 391 distinct tests. They cover the request pipeline on a
   scripted HTTP client, models and collections, an integration suite over real
   sockets against `test/server/server.js`, and 62 scenarios from upstream's
   README run against upstream and this build side by side.
-- **Mutation check**: `npm run mutate` breaks 56 safety-relevant lines one at
+- **Mutation check**: `npm run mutate` breaks 58 safety-relevant lines one at
   a time (what may be retried, what a session reset drops, what the log
   prints, what the cache keeps); every one makes a test fail.
 - **Android**: Titanium SDK 13.4.1.GA, Alloy 3.0.1, Android 15 (API 35, x86_64

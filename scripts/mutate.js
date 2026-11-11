@@ -68,7 +68,7 @@ const MUTATIONS = [
 
 	// ---- cancelling
 	['abort leaves the back-off timer', 'src/client.js', 'if (ctx.timer) {\n\t\t\tclearTimeout(ctx.timer);\n\t\t\tctx.timer = null;\n\t\t}\n\t\tif (ctx.transport) {', 'if (ctx.transport) {'],
-	['cancelled requests call the error callback', 'src/client.js', 'ctx.handle.catch(noop);\n\t\t\tctx.reject(error);\n\t\t\treturn;', 'ctx.handle.catch(noop);\n\t\t\tctx.reject(error);'],
+	['cancelled requests call the error callback', 'src/client.js', 'ctx.handle.catch(noop);\n\t\t\tctx.reject(mapped);\n\t\t\treturn;', 'ctx.handle.catch(noop);\n\t\t\tctx.reject(mapped);'],
 	['deadline ignored', 'src/client.js', 'if (deadline > 0) {\n\t\t\tctx.deadlineTimer', 'if (false) {\n\t\t\tctx.deadlineTimer'],
 	['timeouts reported as network errors', 'src/errors.js', "if (TIMEOUT_PATTERN.test(message) || code === -1001) {\n\t\treturn 'timeout';\n\t}\n\tif (timeout > 0 && elapsed >= timeout) {\n\t\treturn 'timeout';\n\t}", ''],
 
