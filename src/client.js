@@ -136,6 +136,7 @@ function createPipeline(state) {
 			unwatch: null,
 			shared: null,
 			answered: false,
+			elapsed: 0,
 			lead: true,
 			retryPolicy: undefined,
 			cacheKey: null,
@@ -691,7 +692,9 @@ function createPipeline(state) {
 		}
 		const log = logger();
 		if (log.enabled) {
-			log.log(method + ' ' + loggedUrl(ctx) + (ctx.attempt > 1 ? ' (attempt ' + ctx.attempt + ')' : ''));
+			const url = loggedUrl(ctx);
+			log.event('info', method + ' ' + url + (ctx.attempt > 1 ? ' (attempt ' + ctx.attempt + ')' : ''),
+				{ event: 'request', endpoint: endpoint.name, method, url, attempt: ctx.attempt });
 			if (log.verbose) {
 				log.log('headers', log.redactHeaders(headers));
 				if (ctx.body !== undefined) {
@@ -710,6 +713,7 @@ function createPipeline(state) {
 
 	function received(ctx, result) {
 		ctx.transport = null;
+		ctx.elapsed = result.elapsed;
 		const status = result.status;
 		let error = null;
 		if (status >= 400) {
@@ -738,7 +742,13 @@ function createPipeline(state) {
 				name: ctx.endpoint.name
 			})) {
 				const delay = retryDelay(policy, ctx.attempt, error, state.random);
-				logger().log('retrying ' + ctx.endpoint.name + ' in ' + delay + 'ms after ' + (error.status || error.kind));
+				const log = logger();
+				if (log.enabled) {
+					log.event('info', 'retrying ' + ctx.endpoint.name + ' in ' + delay + 'ms after ' + (error.status || error.kind), {
+						event: 'retry', endpoint: ctx.endpoint.name, method: ctx.method, url: loggedUrl(ctx), attempt: ctx.attempt,
+						status: error.status, kind: error.kind, elapsed: ctx.elapsed, delay
+					});
+				}
 				ctx.timer = later(() => {
 					ctx.timer = null;
 					attempt(ctx);
@@ -1201,13 +1211,21 @@ function createPipeline(state) {
 			ctx.deadlineTimer = null;
 		}
 		const log = logger();
-		if (log.enabled) {
-			const took = (now() - ctx.startedAt) + 'ms';
+		if (log.enabled && (error || response)) {
+			const duration = now() - ctx.startedAt;
+			const url = loggedUrl(ctx);
+			const facts = {
+				event: error ? 'error' : 'response', endpoint: ctx.endpoint.name, method: ctx.method, url, attempt: ctx.attempt,
+				status: error ? error.status || 0 : response.status, kind: error ? error.kind : undefined,
+				elapsed: ctx.elapsed, duration, fromCache: Boolean(response && response.fromCache),
+				notModified: Boolean(response && response.notModified)
+			};
 			if (error) {
-				log.warn(ctx.method + ' ' + loggedUrl(ctx) + ' failed: ' + (error.status || error.kind) + ' in ' + took);
-			} else if (response) {
-				log.log(ctx.method + ' ' + loggedUrl(ctx) + ' ' + response.status
-					+ (response.fromCache ? (response.notModified ? ' (not modified)' : response.stale ? ' (stale cache)' : ' (cache)') : '') + ' in ' + took);
+				log.event('warn', ctx.method + ' ' + url + ' failed: ' + (error.status || error.kind) + ' in ' + duration + 'ms', facts);
+			} else {
+				log.event('info', ctx.method + ' ' + url + ' ' + response.status
+					+ (response.fromCache ? (response.notModified ? ' (not modified)' : response.stale ? ' (stale cache)' : ' (cache)') : '')
+					+ ' in ' + duration + 'ms', facts);
 			}
 		}
 	}

@@ -869,6 +869,28 @@ code, interceptors and `mapError` do the same with fewer surprises.
 84ms`); `debug: 'verbose'` adds request headers and request bodies. Response
 headers and bodies are never logged.
 
+A custom `logger(level, message, details)` gets every line instead of the
+console. For the lines about a request, `details` holds the facts, so an app
+can print a line in its own format or keep request timings:
+
+```javascript
+logger(level, message, details) {
+    if (details && details.event === 'response') {
+        console.log(`[api] ${details.method} ${details.url} ${details.status} ${details.elapsed}ms`);
+    }
+}
+```
+
+| `details.event` | when | fields besides `endpoint`, `method`, `url`, `attempt` |
+| --- | --- | --- |
+| `request` | an attempt is sent | |
+| `retry` | an attempt failed and will be repeated | `status`, `kind`, `elapsed`, `delay` |
+| `response` | the call succeeded | `status`, `elapsed`, `duration`, `fromCache`, `notModified` |
+| `error` | the call failed, or was cancelled | `status`, `kind`, `elapsed`, `duration` |
+
+`elapsed` is the time of the last exchange, `duration` that of the whole call
+including back-off; `url` is the URL as it is printed, after redaction.
+
 Before a line is printed, every value whose **name** looks like a credential
 is replaced by `[redacted]`:
 

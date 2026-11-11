@@ -134,6 +134,27 @@ declare namespace Reste {
 		retried: boolean;
 	}
 
+	/** The facts of a debug line about a request, as a custom `logger` gets them. */
+	interface LogEvent {
+		event: 'request' | 'retry' | 'response' | 'error';
+		endpoint: string;
+		method: string;
+		/** The URL as it is printed: after redaction. */
+		url: string;
+		attempt: number;
+		status?: number;
+		/** For 'retry' and 'error': the error's kind. */
+		kind?: ResteError['kind'];
+		/** Milliseconds the last exchange took. */
+		elapsed?: number;
+		/** Milliseconds since the call, back-off included. */
+		duration?: number;
+		/** For 'retry': milliseconds until the next attempt. */
+		delay?: number;
+		fromCache?: boolean;
+		notModified?: boolean;
+	}
+
 	type RequestInterceptor = (request: RequestInfo) => void | Partial<RequestInfo> | Promise<void | Partial<RequestInfo>>;
 	type ResponseInterceptor = (response: Response, request: RequestInfo) => void | Response | Promise<void | Response>;
 	/** Return an Error to replace the error, `{ resolve: value }` to recover the request, nothing to pass it on. */
@@ -479,7 +500,8 @@ declare namespace Reste {
 
 		/** true: log requests; 'verbose': headers and bodies as well (credentials redacted). */
 		debug?: boolean | 'verbose';
-		logger?: (level: 'info' | 'warn' | 'error', message: string, details?: any) => void;
+		/** Replaces console output. For the lines about a request `details` is a `LogEvent`. */
+		logger?: (level: 'info' | 'warn' | 'error', message: string, details?: LogEvent | any) => void;
 		/** More names to treat as credentials in the debug log, and a function applied to every logged URL. */
 		redact?: { headers?: string[]; keys?: string[]; url?: (url: string, request: RequestInfo) => string };
 

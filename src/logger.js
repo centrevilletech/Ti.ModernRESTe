@@ -28,6 +28,8 @@ function normalize(name) {
  * about. Response headers and bodies are never printed.
  *
  * `config.logger(level, message, details)` replaces console output; `debug: 'verbose'` adds headers and bodies.
+ * For the lines about a request `details` holds the facts: { event: 'request' | 'retry' | 'response' | 'error',
+ * endpoint, method, url (as printed), attempt, status, kind, elapsed, duration, delay, fromCache }.
  */
 function createLogger(config) {
 	const enabled = Boolean(config.debug);
@@ -172,6 +174,15 @@ function createLogger(config) {
 		warn(message, details) {
 			if (enabled) {
 				write('warn', message, details);
+			}
+		},
+		/**
+		 * A line about a request (sent, retried, answered, failed). The console gets the message; a custom
+		 * logger also gets the facts, to print a line of its own or to keep request timings.
+		 */
+		event(level, message, facts) {
+			if (enabled) {
+				write(level, message, sink ? facts : undefined);
 			}
 		},
 		/** Printed even with debug off: something the developer has to know about. */

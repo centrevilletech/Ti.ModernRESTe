@@ -447,6 +447,32 @@ describe('debug logging', () => {
 		}
 		assert.ok(lines.length >= 2);
 		lines.forEach(line => assert.match(line, /^::RESTE::/));
+		lines.forEach(line => assert.doesNotMatch(line, /"event"/)); // the facts are for a custom logger only
+	});
+
+	it('hands a custom logger the facts of every line about a request', async () => {
+		const events = [];
+		const { api } = make({
+			debug: true, retry: { retries: 1, baseDelay: 1, jitter: 0 },
+			logger: (level, message, details) => details && details.event && events.push(Object.assign({ level }, details))
+		});
+		let sends = 0;
+		ti.respond(() => (++sends === 1 ? { status: 503 } : { status: 200, body: {} }));
+		await api.get({ id: 3 }, { query: { token: 'SECRET' } });
+		assert.deepEqual(events.map(entry => [entry.event, entry.endpoint, entry.method, entry.attempt, entry.status]), [
+			['request', 'get', 'GET', 1, undefined], ['retry', 'get', 'GET', 1, 503],
+			['request', 'get', 'GET', 2, undefined], ['response', 'get', 'GET', 2, 200]
+		]);
+		events.forEach(entry => assert.equal(entry.url, 'https://api.test/v1/things/3?token=[redacted]'));
+		assert.equal(typeof events[1].elapsed, 'number'); // how long that exchange took
+		assert.equal(typeof events[1].delay, 'number');
+		assert.equal(typeof events[3].elapsed, 'number');
+		assert.ok(events[3].duration >= events[3].elapsed); // the whole call, back-off included
+		assert.equal(events[3].fromCache, false);
+		ti.respond(() => ({ error: 'connection refused' }));
+		await rejection(api.post({ body: {} }));
+		const last = events[events.length - 1];
+		assert.deepEqual([last.level, last.event, last.kind, last.status, last.attempt], ['warn', 'error', 'network', 0, 1]);
 	});
 
 	it('warns when certificate validation is switched off', () => {

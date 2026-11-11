@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- A custom `logger` gets the facts of every line about a request as its
+  third argument (`event`, `endpoint`, `method`, `url`, `attempt`, `status`,
+  `kind`, `elapsed`, `duration`, `delay`, `fromCache`): enough to print a line
+  in an app's own format, one per exchange, or to keep request timings
+
 ### Changed
 
 - `mapError` is also asked about cancelled and stale requests, so a call
