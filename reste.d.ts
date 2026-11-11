@@ -96,7 +96,7 @@ declare namespace Reste {
 
 	/** The promise every call returns. */
 	interface Handle<T = any> extends Promise<T> {
-		/** Cancels the request; resolves nothing, rejects with `kind: 'cancelled'`. Returns false when it was already over. */
+		/** Cancels the request: it rejects with `kind: 'cancelled'`. Returns false when it was already over (or never sent). */
 		abort(reason?: any): boolean;
 		cancel(reason?: any): boolean;
 		/** The Idempotency-Key this call carries, or null. */
@@ -279,6 +279,10 @@ declare namespace Reste {
 		/** Total time allowed including retries; ends as `kind: 'timeout'`. */
 		deadline?: number;
 		signal?: AbortSignal;
+		/**
+		 * false, or a policy for this call. It changes how often and how patiently a request that is safe to
+		 * repeat is sent again; it cannot make an unsafe one (a POST without an idempotency key) repeatable.
+		 */
 		retry?: boolean | number | RetryPolicy;
 		idempotencyKey?: string;
 		/** Names the user action: the same payload gets the same idempotency key until it succeeds. */
@@ -291,6 +295,8 @@ declare namespace Reste {
 		fullResponse?: boolean;
 		/** Upload progress for requests with a body, download progress otherwise: 0 to 1. */
 		onProgress?: (fraction: number) => void;
+		/** The smallest change in progress that is reported. Default 0.01; 0 reports every platform event. */
+		progressStep?: number;
 		onUploadProgress?: (fraction: number) => void;
 		onDownloadProgress?: (fraction: number) => void;
 		/** Downloads: the Ti.Filesystem.File (or path) to write to. */
@@ -335,8 +341,13 @@ declare namespace Reste {
 		headers?: Headers;
 		/** Upstream's name for `headers`. */
 		requestHeaders?: Headers;
-		/** false: do not send the instance's default headers with this method. */
+		/**
+		 * Whether the instance's default headers are sent with this method. Default: yes for relative URLs and
+		 * for full URLs on the base URL's origin, no for any other origin.
+		 */
 		globalHeaders?: boolean;
+		/** Placeholders whose values are replaced in the debug log (those named like a credential are anyway). */
+		redact?: string[];
 		/** Query parameters sent with every call. */
 		query?: Record<string, any>;
 		timeout?: number;
@@ -392,6 +403,13 @@ declare namespace Reste {
 		withCredentials?: boolean;
 	}
 
+	interface IdentityOptions {
+		/** Hold models weakly where the engine has WeakRef (default): a model lives as long as something holds it. */
+		weak?: boolean;
+		/** Without weak references: how many models to keep before dropping the oldest that no collection holds. Default 1000. */
+		limit?: number;
+	}
+
 	interface CollectionDefinition {
 		/** The name in Alloy.Collections. */
 		name: string;
@@ -420,9 +438,12 @@ declare namespace Reste {
 
 	interface ModelDefinition {
 		name: string;
-		/** The id attribute. Default 'id'. */
+		/** The attribute that holds the id in the server's data. Default 'id'. */
 		id?: string;
-		/** false: do not also copy the id to an `id` attribute (upstream did, when `id` names another attribute). */
+		/**
+		 * As in 1.x (the default) a model's id is always its `id` attribute, and when `id` above names another
+		 * attribute its value is copied into `id`. false: that attribute is the model's id and nothing is copied.
+		 */
 		mirrorId?: boolean;
 		read?: string;
 		create?: string;
@@ -437,7 +458,7 @@ declare namespace Reste {
 		/** When given, its result is sent as the DELETE body; otherwise DELETE has none. */
 		beforeDelete?: (body: any, model: any) => any;
 		/** One model instance per id, shared by every collection of this model. */
-		identity?: boolean;
+		identity?: boolean | IdentityOptions;
 		/** save(), destroy() and create() are optimistic by default. */
 		optimistic?: boolean;
 		/** Also keep one instance in Alloy.Models (true: under the model's name). */
@@ -459,7 +480,8 @@ declare namespace Reste {
 		/** true: log requests; 'verbose': headers and bodies as well (credentials redacted). */
 		debug?: boolean | 'verbose';
 		logger?: (level: 'info' | 'warn' | 'error', message: string, details?: any) => void;
-		redact?: { headers?: string[]; keys?: string[] };
+		/** More names to treat as credentials in the debug log, and a function applied to every logged URL. */
+		redact?: { headers?: string[]; keys?: string[]; url?: (url: string, request: RequestInfo) => string };
 
 		/** Default true since 2.0. false: callbacks receive the parsed error body only. */
 		errorsAsObjects?: boolean;
@@ -481,20 +503,34 @@ declare namespace Reste {
 		meta?: Path;
 		fullResponse?: boolean;
 		mapError?: (error: ResteError | Error, request: RequestInfo) => any;
-		/** Hooks by HTTP status, fired once per event. Answer 'retry' (or a promise of it) to have the requests sent again. */
+		/**
+		 * Hooks by HTTP status, fired once per event. Answer 'retry' (or a promise of it) to have the requests
+		 * sent again: those that are safe to repeat after any status, every request after one of `authStatuses`.
+		 */
 		onStatus?: Record<number, (error: ResteError, request: RequestInfo) => void | 'retry' | { retry: boolean } | Promise<void | 'retry' | { retry: boolean }>>;
+		/** Statuses that mean "refused before anything was done": a hook's 'retry' re-sends any request. Default [401]. */
+		authStatuses?: number[];
 		interceptors?: Interceptors;
 
 		retry?: boolean | number | RetryPolicy;
 		idempotency?: { header?: string; methods?: string[]; generate?: () => string };
-		cache?: { store?: CacheStore; maxEntries?: number; prefix?: string; defaults?: CachePolicy };
+		cache?: {
+			store?: CacheStore;
+			maxEntries?: number;
+			prefix?: string;
+			defaults?: CachePolicy;
+			/** Part of every cache key: the signed-in user's id, so one user never gets another's cached answer. */
+			scope?: string | number | (() => string | number | null | undefined);
+		};
 		dedupe?: boolean;
 		pagination?: Pagination;
 		/** Reject at once, without sending, when Ti.Network.online is false. */
 		failWhenOffline?: boolean;
+		/** The smallest change in upload or download progress that is reported. Default 0.01. */
+		progressStep?: number;
 
 		/** Defaults for models and collections. */
-		identity?: boolean;
+		identity?: boolean | IdentityOptions;
 		chunk?: number;
 		events?: 'coalesce' | 'each';
 		changeEvent?: string;
@@ -667,17 +703,22 @@ declare namespace Reste {
 		model(name: string, id: any): any;
 		collections: Record<string, any>;
 		models: Record<string, any>;
-		identity: { get(name: string, id: any): any; clear(name?: string): void };
+		identity: { get(name: string, id: any): any; clear(name?: string): void; size(name: string): number; sizes(): Record<string, number> };
 		modelConfig?: Record<string, ModelDefinition>;
-
-		/** The methods from the config: api.getTodos(...). Declare them for full typing: `Reste.Instance & { getTodos: Reste.Method<Todo[]> }`. */
-		[method: string]: any;
+		/** Counts for finding leaks: requests in flight, cached responses, compiled URL variants, identity maps. */
+		inspect(): { inFlight: number; shared: number; cache: number; variants: Record<string, number>; identity: Record<string, number> };
 	}
+
+	/**
+	 * The methods made from the config. `new Reste<{ getTodos: Todo[]; getTodo: Todo }>()` types each of them
+	 * and makes a misspelt name an error; without the type argument every name is a method resolving `any`.
+	 */
+	type Methods<M> = { [K in keyof M]: Method<M[K]> };
 }
 
 interface ResteStatic {
-	new (): Reste.Instance;
-	(): Reste.Instance;
+	new <M = Record<string, any>>(): Reste.Instance & Reste.Methods<M>;
+	<M = Record<string, any>>(): Reste.Instance & Reste.Methods<M>;
 	readonly version: string;
 	ResteError: Reste.ResteErrorConstructor;
 	createAbortController(): Reste.AbortController;
