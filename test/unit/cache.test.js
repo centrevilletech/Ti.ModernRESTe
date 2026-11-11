@@ -82,6 +82,32 @@ describe('caching', () => {
 		assert.equal(second.header('ETag'), '"v1"');
 	});
 
+	it('treats a 200 that carries the validator it sent as not modified (what iOS hands back for a 304)', async () => {
+		const { api } = make();
+		ti.respond(() => ({ status: 200, body: { items: [1, 2] }, headers: { ETag: '"v1"' } }));
+		const first = await api.catalog({ id: 1 }, { fullResponse: true });
+		const original = JSON.parse;
+		let parses = 0;
+		JSON.parse = function () {
+			parses++;
+			return original.apply(this, arguments);
+		};
+		let second;
+		try {
+			second = await api.catalog({ id: 1 }, { fullResponse: true });
+		} finally {
+			JSON.parse = original;
+		}
+		assert.equal(ti.last.headers['If-None-Match'], '"v1"');
+		assert.equal(second.notModified, true);
+		assert.equal(second.data, first.data);
+		assert.equal(parses, 0);
+		ti.respond(() => ({ status: 200, body: { items: [3] }, headers: { ETag: '"v2"' } }));
+		const third = await api.catalog({ id: 1 }, { fullResponse: true });
+		assert.equal(third.notModified, false);
+		assert.deepEqual(third.data, { items: [3] });
+	});
+
 	it('falls back to If-Modified-Since when there is no ETag', async () => {
 		const { api } = make();
 		ti.respond(request => (request.headers['If-Modified-Since']

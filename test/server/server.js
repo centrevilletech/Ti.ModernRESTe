@@ -34,6 +34,7 @@ function freshState() {
 		ordersCreated: 0,
 		flaky: new Map(), // key -> failures so far
 		limited: 0,
+		notModified: 0, // 304s sent
 		token: 'good-token',
 		refreshes: 0,
 		hits: {}
@@ -128,7 +129,7 @@ function start(options) {
 			return;
 		}
 		if (path === '/_stats') {
-			send(response, 200, { hits: state.hits, ordersCreated: state.ordersCreated, refreshes: state.refreshes });
+			send(response, 200, { hits: state.hits, ordersCreated: state.ordersCreated, refreshes: state.refreshes, notModified: state.notModified });
 			return;
 		}
 		if (path === '/health') {
@@ -198,6 +199,7 @@ function start(options) {
 		if (path === '/catalog' && method === 'GET') {
 			const etag = '"catalog-v' + state.catalogVersion + '"';
 			if (request.headers['if-none-match'] === etag) {
+				state.notModified++;
 				response.writeHead(304, { ETag: etag });
 				response.end();
 				return;

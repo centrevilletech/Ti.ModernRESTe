@@ -1181,7 +1181,13 @@
 			function buildResponse(ctx, outcome) {
 				const endpoint = ctx.endpoint;
 				const http = outcome.http;
-				if (outcome.status === 304 && ctx.cacheEntry) {
+				// Not modified: a 304, or a 200 that carries the validator we sent. iOS answers a conditional request
+				// that way: its URL loading system swallows the 304 and hands back the stored 200 (verified on
+				// Titanium SDK 13.4.1), and a server that ignores If-None-Match looks the same. Either way the
+				// representation is the one already held, so it is not parsed again.
+				const entry = ctx.cacheEntry;
+				if (entry && (outcome.status === 304
+					|| (outcome.status === 200 && entry.etag && transport.readHeader(http, 'ETag') === entry.etag))) {
 					state.cache.revalidated(ctx.cacheKey, ctx.cacheEntry, ctx.cachePolicy, transport.readHeaders(http));
 					const cached = cachedResponse(ctx, ctx.cacheEntry, false);
 					cached.notModified = true;
