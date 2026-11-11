@@ -1776,9 +1776,6 @@
 						});
 					} else {
 						episode.decision = answer;
-						if (answer === false) {
-							forget(status, episode); // not the event this hook stands for: the next response asks again
-						}
 					}
 				}
 				const decide = () => {
@@ -1788,7 +1785,8 @@
 					const decision = episode.decision;
 					if (decision === false) {
 						// The hook declined (a 401 that was a wrong password, not an expired session). Its firing does
-						// not count: a request that had joined it while it was undecided asks the hook for itself.
+						// not count: the next response with this status asks the hook again, and a request that had
+						// joined this firing while it was undecided asks for itself.
 						forget(status, episode);
 						if (episode.owner !== ctx) {
 							runStatusHooks(ctx, error);
