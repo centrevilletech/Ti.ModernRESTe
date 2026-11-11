@@ -34,6 +34,8 @@ const MUTATIONS = [
 	['session: late responses are delivered', 'src/client.js', 'if (ctx.endpoint.session !== false && ctx.generation !== state.generation) {\n\t\t\tfail(', 'if (false) {\n\t\t\tfail('],
 	['session: requests of two sessions are joined', 'src/client.js', "key += '\\nsession:' + ctx.generation;", "key += '';"],
 	['session: a reset inside a status hook drops the answer that fired it', 'src/client.js', 'ctx.generation === state.generation || ctx.answered) {', 'ctx.generation === state.generation) {'],
+	['hooks: a firing the hook declined still swallows the next response', 'src/client.js', 'if (answer === false) {\n\t\t\t\t\tforget(status, episode);', 'if (answer === false) {'],
+	['session: a request re-sent by a hook escapes the next reset', 'src/client.js', 'ctx.answered = false; // on its way again', '// on its way again'],
 	['session: reset keeps idempotency actions', 'src/index.js', 'state.keys.clear();\n\t\t\tif (settings.clearCache', 'if (settings.clearCache'],
 	['session: reset keeps the collections\' paging', 'src/sync.js', 'if (meta.pager) {\n\t\t\t\t\tmeta.pager.reset();\n\t\t\t\t}', ''],
 

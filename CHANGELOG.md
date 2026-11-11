@@ -4,6 +4,10 @@
 
 ### Added
 
+- A status hook can answer `false`: the response was not its event (one
+  status used for two things), and the firing does not swallow the next
+  response with that status
+
 - `methodOverride` (per instance or per method, off by default): a request
   the platform cannot send with its body, a `DELETE` on Android, goes out as
   `POST` with the real method in `X-HTTP-Method-Override` (the header, the
@@ -30,6 +34,9 @@
   hooks and `config.onError` still never hear of such a request
 
 ### Fixed
+
+- A request a status hook had sent again stayed exempt from the next session
+  reset: it is in flight again and dropped with the session like any other
 
 - A response with no freshness left and no validator (`ttl: 0`, or the
   `'etag'` policy, answered without an `ETag`) was kept, and persisted,

@@ -544,8 +544,9 @@ declare namespace Reste {
 		/**
 		 * Hooks by HTTP status, fired once per event. Answer 'retry' (or a promise of it) to have the requests
 		 * sent again: those that are safe to repeat after any status, every request after one of `authStatuses`.
+		 * Answer false when the response was not the hook's event: the firing does not count.
 		 */
-		onStatus?: Record<number, (error: ResteError, request: RequestInfo) => void | 'retry' | { retry: boolean } | Promise<void | 'retry' | { retry: boolean }>>;
+		onStatus?: Record<number, (error: ResteError, request: RequestInfo) => void | false | 'retry' | { retry: boolean } | Promise<void | false | 'retry' | { retry: boolean }>>;
 		/** Statuses that mean "refused before anything was done": a hook's 'retry' re-sends any request. Default [401]. */
 		authStatuses?: number[];
 		interceptors?: Interceptors;

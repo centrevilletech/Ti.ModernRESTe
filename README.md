@@ -516,6 +516,22 @@ status only requests that are safe to repeat. So a hook on 503 that answers
 `request.retried` tells the hook that a request already had its second chance,
 and a hook's answer that arrives after the session was reset re-sends nothing.
 
+When an API uses one status for two things (401 for a wrong password and for
+an expired session), the hook says which it was. Answer `false` for "not
+mine": that firing does not count, so the next response with the status asks
+the hook again, also one from a request that was sent earlier.
+
+```javascript
+onStatus: {
+    401: (error, request) => {
+        if (error.body.code !== 'SESSION_EXPIRED') {
+            return false;
+        }
+        signOut();
+    }
+}
+```
+
 ## Sessions
 
 ```javascript

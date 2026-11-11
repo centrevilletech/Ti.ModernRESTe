@@ -325,6 +325,39 @@ describe('status hooks', () => {
 		assert.equal(ti.requests[1].aborted, true);
 	});
 
+	it('a hook that answers false did not handle it: the next response with that status asks again, even one sent earlier', async () => {
+		// One status for two things (a wrong password and an expired session are both 401): the firing for the
+		// first must not swallow the second.
+		const asked = [];
+		const { api } = make({ onStatus: { 401: (error, request) => { asked.push(request.name); return error.body.code === 'EXPIRED'; } } });
+		ti.respond(() => null);
+		const expired = api.list(); // sent first, answered last
+		const wrong = api.post({ body: {} });
+		ti.requests[1].respond({ status: 401, body: { code: 'WRONG_PASSWORD' } });
+		assert.equal((await rejection(wrong)).status, 401);
+		ti.requests[0].respond({ status: 401, body: { code: 'EXPIRED' } });
+		assert.equal((await rejection(expired)).status, 401);
+		assert.deepEqual(asked, ['post', 'list']);
+		// The same when the hook takes its time: a request that joined the firing while it was undecided asks for itself.
+		const slow = [];
+		const made = make({ onStatus: { 401: (error, request) => wait(10).then(() => { slow.push(request.name); return false; }) } });
+		ti.respond(() => ({ status: 401, body: {} }));
+		await Promise.all([rejection(made.api.list()), rejection(made.api.get({ id: 1 }))]);
+		assert.deepEqual(slow.sort(), ['get', 'list']);
+	});
+
+	it('a request sent again by a hook is in flight again: a session reset drops it', async () => {
+		let answered = 0;
+		const { api } = make({ onStatus: { 401: () => 'retry' } });
+		ti.respond(() => (++answered === 1 ? { status: 401 } : null));
+		const handle = api.list();
+		await wait(5);
+		assert.equal(ti.requests.length, 2); // the second send is waiting for its answer
+		api.session.reset();
+		assert.equal(ti.requests[1].aborted, true);
+		assert.equal((await rejection(handle)).kind, 'stale');
+	});
+
 	it('a hook that throws does not break the request', async () => {
 		const { api } = make({ logger: () => {}, onStatus: { 500: () => { throw new Error('hook bug'); } } });
 		ti.respond(() => ({ status: 500 }));

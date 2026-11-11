@@ -1715,7 +1715,7 @@
 				ctx.answered = true;
 				let episode = state.episodes[status];
 				if (!episode || episode.generation !== state.generation || (!episode.pending && ctx.sentSeq > episode.seq)) {
-					episode = state.episodes[status] = { seq: ++state.seq, generation: state.generation, decision: undefined, pending: null };
+					episode = state.episodes[status] = { seq: ++state.seq, generation: state.generation, decision: undefined, pending: null, owner: ctx };
 					let answer;
 					try {
 						answer = hook(error, describe(ctx));
@@ -1734,6 +1734,9 @@
 						});
 					} else {
 						episode.decision = answer;
+						if (answer === false) {
+							forget(status, episode); // not the event this hook stands for: the next response asks again
+						}
 					}
 				}
 				const decide = () => {
@@ -1741,6 +1744,15 @@
 						return;
 					}
 					const decision = episode.decision;
+					if (decision === false) {
+						// The hook declined (a 401 that was a wrong password, not an expired session). Its firing does
+						// not count: a request that had joined it while it was undecided asks the hook for itself.
+						forget(status, episode);
+						if (episode.owner !== ctx) {
+							runStatusHooks(ctx, error);
+							return;
+						}
+					}
 					const again = decision === 'retry' || (isObject(decision) && decision.retry === true);
 					// Sending again is allowed for a request that is safe to repeat, and for any request after a status
 					// that means "refused before anything was done" (401 by default: config.authStatuses).
@@ -1751,6 +1763,7 @@
 						(ctx.hookRetried || (ctx.hookRetried = {}))[status] = true;
 						ctx.redispatch = true;
 						ctx.cacheEntry = null;
+						ctx.answered = false; // on its way again: a session reset drops it like any request in flight
 						attempt(ctx);
 					} else {
 						fail(ctx, error);
@@ -1760,6 +1773,12 @@
 					episode.pending.then(decide);
 				} else {
 					decide();
+				}
+			}
+
+			function forget(status, episode) {
+				if (state.episodes[status] === episode) {
+					delete state.episodes[status];
 				}
 			}
 
