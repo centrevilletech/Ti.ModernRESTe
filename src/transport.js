@@ -60,18 +60,10 @@ function send(factory, request, done) {
 	http.onload = finish;
 	http.onerror = finish;
 	if (request.onUploadProgress) {
-		http.onsendstream = function (event) {
-			if (!finished) {
-				request.onUploadProgress(clamp(event && event.progress));
-			}
-		};
+		http.onsendstream = stepped(request.onUploadProgress, request.progressStep, () => finished);
 	}
 	if (request.onDownloadProgress) {
-		http.ondatastream = function (event) {
-			if (!finished) {
-				request.onDownloadProgress(clamp(event && event.progress));
-			}
-		};
+		http.ondatastream = stepped(request.onDownloadProgress, request.progressStep, () => finished);
 	}
 
 	http.open(request.method, request.url);
@@ -104,6 +96,27 @@ function send(factory, request, done) {
 				// Aborting a client that never connected throws on some platforms; the request is over anyway.
 			}
 		}
+	};
+}
+
+/**
+ * A progress listener that calls `report` only when progress moved by at least `step` (1 % by default), and
+ * always for the end. Titanium's Android client reports every few hundred bytes: thousands of events for one
+ * photo, each of which would otherwise reach the app's UI code.
+ */
+function stepped(report, step, isFinished) {
+	const least = step === undefined || step === null ? 0.01 : step;
+	let last = -1;
+	return function (event) {
+		if (isFinished()) {
+			return;
+		}
+		const value = clamp(event && event.progress);
+		if (value === last || (value < 1 && last >= 0 && value - last < least && value >= last)) {
+			return;
+		}
+		last = value;
+		report(value);
 	};
 }
 
@@ -166,4 +179,4 @@ function readText(http) {
 	}
 }
 
-module.exports = { send, readHeaders, readHeader, readText, CLIENT_OPTIONS };
+module.exports = { send, readHeaders, readHeader, readText, stepped, CLIENT_OPTIONS };

@@ -984,6 +984,12 @@
 						return undefined;
 					}
 					body = {}; // upstream always sent a JSON body with POST, PUT and PATCH
+				} else if (ctx.method === 'DELETE' && !state.warnedDeleteBody && typeof Ti !== 'undefined' && Ti.Platform
+					&& Ti.Platform.osname === 'android') {
+					// Verified on Titanium SDK 13.4.1: the Android HTTP client sends DELETE without its body.
+					state.warnedDeleteBody = true;
+					logger().always(endpoint.name + ' sends a body with DELETE: Titanium\'s Android HTTP client drops it (iOS sends it). '
+						+ 'Put the data in the URL, or use POST.');
 				}
 				if (typeof body === 'string') {
 					return body;
@@ -1027,6 +1033,7 @@
 						clientOptions: endpoint.clientOptions || config.clientOptions,
 						securityManager: endpoint.securityManager || config.securityManager,
 						validatesSecureCertificate: has(config, 'validatesSecureCertificate') ? config.validatesSecureCertificate : undefined,
+						progressStep: options.progressStep !== undefined ? options.progressStep : config.progressStep,
 						onUploadProgress: options.onUploadProgress || (upload && !endpoint.download ? progress : null),
 						onDownloadProgress: options.onDownloadProgress || (!upload || endpoint.download ? progress : null)
 					};
@@ -4737,18 +4744,10 @@
 			http.onload = finish;
 			http.onerror = finish;
 			if (request.onUploadProgress) {
-				http.onsendstream = function (event) {
-					if (!finished) {
-						request.onUploadProgress(clamp(event && event.progress));
-					}
-				};
+				http.onsendstream = stepped(request.onUploadProgress, request.progressStep, () => finished);
 			}
 			if (request.onDownloadProgress) {
-				http.ondatastream = function (event) {
-					if (!finished) {
-						request.onDownloadProgress(clamp(event && event.progress));
-					}
-				};
+				http.ondatastream = stepped(request.onDownloadProgress, request.progressStep, () => finished);
 			}
 
 			http.open(request.method, request.url);
@@ -4781,6 +4780,27 @@
 						// Aborting a client that never connected throws on some platforms; the request is over anyway.
 					}
 				}
+			};
+		}
+
+		/**
+		 * A progress listener that calls `report` only when progress moved by at least `step` (1 % by default), and
+		 * always for the end. Titanium's Android client reports every few hundred bytes: thousands of events for one
+		 * photo, each of which would otherwise reach the app's UI code.
+		 */
+		function stepped(report, step, isFinished) {
+			const least = step === undefined || step === null ? 0.01 : step;
+			let last = -1;
+			return function (event) {
+				if (isFinished()) {
+					return;
+				}
+				const value = clamp(event && event.progress);
+				if (value === last || (value < 1 && last >= 0 && value - last < least && value >= last)) {
+					return;
+				}
+				last = value;
+				report(value);
 			};
 		}
 
@@ -4843,7 +4863,7 @@
 			}
 		}
 
-		module.exports = { send, readHeaders, readHeader, readText, CLIENT_OPTIONS };
+		module.exports = { send, readHeaders, readHeader, readText, stepped, CLIENT_OPTIONS };
 	},
 	"./url": function (module, exports, require) {
 		const { ResteError } = require('./errors');

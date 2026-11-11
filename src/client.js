@@ -511,6 +511,12 @@ function createPipeline(state) {
 				return undefined;
 			}
 			body = {}; // upstream always sent a JSON body with POST, PUT and PATCH
+		} else if (ctx.method === 'DELETE' && !state.warnedDeleteBody && typeof Ti !== 'undefined' && Ti.Platform
+			&& Ti.Platform.osname === 'android') {
+			// Verified on Titanium SDK 13.4.1: the Android HTTP client sends DELETE without its body.
+			state.warnedDeleteBody = true;
+			logger().always(endpoint.name + ' sends a body with DELETE: Titanium\'s Android HTTP client drops it (iOS sends it). '
+				+ 'Put the data in the URL, or use POST.');
 		}
 		if (typeof body === 'string') {
 			return body;
@@ -554,6 +560,7 @@ function createPipeline(state) {
 				clientOptions: endpoint.clientOptions || config.clientOptions,
 				securityManager: endpoint.securityManager || config.securityManager,
 				validatesSecureCertificate: has(config, 'validatesSecureCertificate') ? config.validatesSecureCertificate : undefined,
+				progressStep: options.progressStep !== undefined ? options.progressStep : config.progressStep,
 				onUploadProgress: options.onUploadProgress || (upload && !endpoint.download ? progress : null),
 				onDownloadProgress: options.onDownloadProgress || (!upload || endpoint.download ? progress : null)
 			};

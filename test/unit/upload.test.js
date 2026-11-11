@@ -62,6 +62,27 @@ describe('uploads', () => {
 		assert.deepEqual(await rejection(handle), { mapped: 413, key: handle.idempotencyKey });
 	});
 
+	it('report progress in steps: thousands of platform events become at most a hundred calls', async () => {
+		const { api } = make();
+		ti.respond(() => null);
+		const progress = [];
+		const handle = api.upload({ body: { photo: ti.createBlob('x') } }, { onProgress: value => progress.push(value) });
+		for (let i = 0; i <= 6000; i++) {
+			ti.last.progress(i / 6000); // what Titanium's Android client does for a 3 MB upload
+		}
+		assert.ok(progress.length <= 101, progress.length + ' calls');
+		assert.equal(progress[0], 0);
+		assert.equal(progress[progress.length - 1], 1);
+		handle.abort();
+		await rejection(handle);
+		const every = [];
+		const fine = api.upload({ body: { photo: ti.createBlob('x') } }, { onProgress: value => every.push(value), progressStep: 0 });
+		[0.001, 0.002, 0.003].forEach(value => ti.last.progress(value));
+		assert.deepEqual(every, [0.001, 0.002, 0.003]);
+		fine.abort();
+		await rejection(fine);
+	});
+
 	it('can be cancelled, and report no progress afterwards', async () => {
 		const { api } = make();
 		ti.respond(() => null);
