@@ -112,6 +112,19 @@ describe('the debug log and credentials', () => {
 		assert.deepEqual(leaked(text()), []);
 	});
 
+	it('lets a name that only looks like a credential be shown: redact.allow', async () => {
+		const { api, text } = make({
+			debug: 'verbose', redact: { allow: ['session_token', 'X-Request-Key'] },
+			requestHeaders: { 'X-Request-Key': 'visible-header', Authorization: 'Bearer SECRET-1' },
+			methods: [{ name: 'search', post: 'search' }]
+		});
+		await api.search({ query: { session_token: 'visible-query', access_token: 'SECRET-2' }, body: { session_token: 'visible-body', token: 'SECRET-3' } });
+		assert.deepEqual(leaked(text()), []);
+		assert.match(text(), /session_token=visible-query/);
+		assert.match(text(), /visible-body/);
+		assert.match(text(), /visible-header/);
+	});
+
 	it('does not print response headers or bodies', async () => {
 		const { api, text } = make({ debug: 'verbose', methods: [{ name: 'get', get: 'things' }] });
 		await api.get();

@@ -991,8 +991,10 @@ string body that is neither JSON nor a form is printed as its length only.
 
 What this cannot do: recognise a secret under an innocent name (`value`,
 `data`), inside free text, or in a path segment it was not told about. Add
-names with `redact: { headers: ['X-Tenant'], keys: ['iban'] }`, rewrite URLs
-with `redact: { url: (url, request) => ... }`, send the lines elsewhere with
+names with `redact: { headers: ['X-Tenant'], keys: ['iban'] }`, exempt a name
+that only looks like a credential with `redact: { allow: ['session_token'] }`
+(a search session id, say), rewrite the already redacted URL with
+`redact: { url: (url, request) => ... }`, send the lines elsewhere with
 `logger: (level, message, details) => ...`, and do not ship with `debug` on.
 
 ## TLS

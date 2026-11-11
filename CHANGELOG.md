@@ -7,6 +7,7 @@
 - A status hook can answer `false`: the response was not its event (one
   status used for two things), and the firing does not swallow the next
   response with that status
+- `redact.allow`: names that only look like a credential and may be logged
 
 - `methodOverride` (per instance or per method, off by default): a request
   the platform cannot send with its body, a `DELETE` on Android, goes out as

@@ -3285,7 +3285,8 @@
 		 * The debug logger. Off unless `config.debug` is set, and then it replaces by "[redacted]" every value whose
 		 * *name* looks like a credential: request headers, fields of JSON and form bodies (also when the body is a
 		 * string), query parameters, and path values whose placeholder is named like one or that the method lists in
-		 * `redact`. `config.redact` adds names ({ headers, keys }) and a function for the URL ({ url }).
+		 * `redact`. `config.redact` adds names ({ headers, keys }), exempts names that only look like a credential
+		 * ({ allow }) and takes a function for the URL ({ url }).
 		 *
 		 * It cannot recognise a secret under an innocent name, in free text, or in a path segment it was not told
 		 * about. Response headers and bodies are never printed.
@@ -3300,12 +3301,13 @@
 			const sink = isFunction(config.logger) ? config.logger : null;
 			const redact = config.redact || {};
 			const extra = [].concat(redact.headers || [], redact.keys || []).map(normalize).filter(Boolean);
+			const allowed = [].concat(redact.allow || []).map(normalize).filter(Boolean);
 			const urlHook = isFunction(redact.url) ? redact.url : null;
 
 			function sensitive(name) {
 				const plain = normalize(name);
-				if (!plain) {
-					return false;
+				if (!plain || allowed.indexOf(plain) !== -1) {
+					return false; // nothing to judge, or a name the config says only looks like a credential
 				}
 				if (SENSITIVE_NAMES.indexOf(plain) !== -1 || (plain.length > 3 && plain.slice(-3) === 'key')) {
 					return true;

@@ -517,8 +517,11 @@ declare namespace Reste {
 		debug?: boolean | 'verbose';
 		/** Replaces console output. For the lines about a request `details` is a `LogEvent`. */
 		logger?: (level: 'info' | 'warn' | 'error', message: string, details?: LogEvent | any) => void;
-		/** More names to treat as credentials in the debug log, and a function applied to every logged URL. */
-		redact?: { headers?: string[]; keys?: string[]; url?: (url: string, request: RequestInfo) => string };
+		/**
+		 * More names to treat as credentials in the debug log (`headers`, `keys`), names that only look like one
+		 * and may be shown (`allow`), and a function applied to every logged URL after redaction (`url`).
+		 */
+		redact?: { headers?: string[]; keys?: string[]; allow?: string[]; url?: (url: string, request: RequestInfo) => string };
 
 		/** Default true since 2.0. false: callbacks receive the parsed error body only. */
 		errorsAsObjects?: boolean;
