@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed
+
+- `mapError` is also asked about cancelled and stale requests, so a call
+  rejects with the app's own error class whatever happened to it. Callbacks,
+  hooks and `config.onError` still never hear of such a request
+
 ### Fixed
 
 - A status hook that calls `session.reset()` no longer turns the answer that

@@ -41,6 +41,8 @@ const MUTATIONS = [
 	['a throwing header function escapes', 'src/client.js', 'try {\n\t\t\tctx.headers = resolveHeaders(ctx);\n\t\t} catch (error) {\n\t\t\tabandon(ctx, toResteError(error));\n\t\t\treturn;\n\t\t}', 'ctx.headers = resolveHeaders(ctx);'],
 	['a failure before sending does not reach callers that share the request', 'src/client.js', 'if (ctx.shared) {\n\t\t\t\tsettle(ctx, { error, status: 0, http: null, body: undefined });\n\t\t\t} else {\n\t\t\t\tfailed(ctx, error);\n\t\t\t}', 'failed(ctx, error);'],
 
+	['errors: a cancelled request rejects without the app\'s mapper', 'src/client.js', 'ctx.handle.catch(noop);\n\t\t\tctx.reject(mapped);', 'ctx.handle.catch(noop);\n\t\t\tctx.reject(error);'],
+
 	// ---- credentials
 	['log: query values not redacted', 'src/logger.js', "const mark = out.indexOf('?');", 'const mark = -1;'],
 	['log: body fields not redacted', 'src/logger.js', 'out[keys[i]] = sensitive(keys[i]) ? REDACTED : redactValue(value[keys[i]], depth + 1);', 'out[keys[i]] = redactValue(value[keys[i]], depth + 1);'],

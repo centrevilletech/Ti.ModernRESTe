@@ -312,6 +312,12 @@ Calls then reject with what the mapper returns (callbacks receive it too). An
 error thrown by one of your interceptors reaches the mapper, and the caller,
 untouched.
 
+The mapper is also asked about a cancelled or stale request (`error.isCancelled`),
+so a caller only ever catches one error class. No callback, hook or global
+handler hears of such a request. Give your error an `isCancelled` that is true
+for them: [lists that follow a collection](#lists-that-follow-a-collection)
+read it to tell a cancellation from a failure.
+
 ## Retries
 
 Off unless configured. `retry: true` uses the defaults:
@@ -547,7 +553,8 @@ api.abortAll(request => request.name === 'search');
 
 `abort()` works at any point: while an interceptor is still working, during a
 retry's back-off, mid-upload. A cancelled request calls no callback and no
-global error handler; only its promise rejects.
+global error handler; only its promise rejects (with what `mapError` makes of
+it, when there is one).
 
 ## Uploads and downloads
 

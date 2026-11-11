@@ -502,6 +502,7 @@ declare namespace Reste {
 		unwrap?: Path;
 		meta?: Path;
 		fullResponse?: boolean;
+		/** What calls reject with. Also asked about cancelled and stale requests (`error.isCancelled`). */
 		mapError?: (error: ResteError | Error, request: RequestInfo) => any;
 		/**
 		 * Hooks by HTTP status, fired once per event. Answer 'retry' (or a promise of it) to have the requests

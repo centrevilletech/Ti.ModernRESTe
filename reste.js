@@ -1732,19 +1732,10 @@
 				if (ctx.background) {
 					return;
 				}
-				if (error.kind === 'cancelled' || error.kind === 'stale') {
-					// Nobody asked to be told about a request they cancelled: only the promise settles, and a caller
-					// who kept the handle just to abort it must not get an "unhandled rejection" for doing so.
-					ctx.handle.catch(noop);
-					ctx.reject(error);
-					return;
-				}
 				const endpoint = ctx.endpoint;
 				const config = state.config;
-				if (ctx.action && error.kind === 'http' && error.status < 500 && error.status !== 408 && error.status !== 409
-					&& error.status !== 425 && error.status !== 429) {
-					state.keys.done(ctx.action); // a definite answer: repeating the action is a new action
-				}
+				// What the promise rejects with is the app's own error whenever it has a mapper, a cancelled or
+				// stale request included: callers then deal with one error class.
 				let mapped = error;
 				const mapper = endpoint.mapError || config.mapError;
 				if (isFunction(mapper)) {
@@ -1756,6 +1747,17 @@
 					} catch (thrown) {
 						mapped = thrown;
 					}
+				}
+				if (error.kind === 'cancelled' || error.kind === 'stale') {
+					// Nobody asked to be told about a request they cancelled: only the promise settles, and a caller
+					// who kept the handle just to abort it must not get an "unhandled rejection" for doing so.
+					ctx.handle.catch(noop);
+					ctx.reject(mapped);
+					return;
+				}
+				if (ctx.action && error.kind === 'http' && error.status < 500 && error.status !== 408 && error.status !== 409
+					&& error.status !== 425 && error.status !== 429) {
+					state.keys.done(ctx.action); // a definite answer: repeating the action is a new action
 				}
 				const value = config.errorsAsObjects === false ? error.body : mapped;
 				const retry = () => execute(endpoint, ctx.params, ctx.options, ctx.onLoad, ctx.onError);

@@ -125,6 +125,26 @@ describe('mapError', () => {
 		assert.equal((await rejection(api.get())).kind, 'http');
 	});
 
+	it('maps a cancelled and a stale request too, without telling callbacks or hooks about them', async () => {
+		const heard = [];
+		const { api } = make({
+			onError: error => heard.push(error),
+			mapError: error => new ApiError(error.isCancelled ? 'CANCELLED' : 'OTHER', error.message, {})
+		});
+		ti.respond(() => null);
+		const cancelled = api.get();
+		cancelled.abort();
+		const first = await rejection(cancelled);
+		assert.ok(first instanceof ApiError);
+		assert.equal(first.code, 'CANCELLED');
+		const outdated = api.get();
+		api.session.reset();
+		const second = await rejection(outdated);
+		assert.ok(second instanceof ApiError);
+		assert.equal(second.code, 'CANCELLED');
+		assert.deepEqual(heard, []);
+	});
+
 	it('a method can have its own mapper; a mapper that throws rejects with what it threw', async () => {
 		const { api } = make({
 			mapError: () => 'global',
