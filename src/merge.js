@@ -1,33 +1,8 @@
 'use strict';
 
-const { deepEqual, isObject, isFunction, later } = require('./util');
+const { isFunction, later } = require('./util');
+const { diffAttributes } = require('./attributes');
 const { ResteError } = require('./errors');
-
-/**
- * The attributes of `incoming` that differ from `current`, or null when none do. Keys `incoming` lacks are
- * left alone: a list row usually carries fewer fields than the detail of the same resource. `pending` names
- * attributes to leave alone as well (optimistic changes in flight).
- */
-function diffAttributes(current, incoming, pending) {
-	let diff = null;
-	const keys = Object.keys(incoming);
-	for (let i = 0; i < keys.length; i++) {
-		const key = keys[i];
-		if (pending && pending[key] > 0) {
-			continue; // changed on the device, not answered by the server yet: the device's value stands
-		}
-		const a = current[key];
-		const b = incoming[key];
-		if (a === b) {
-			continue;
-		}
-		if (isObject(a) && isObject(b) && deepEqual(a, b)) {
-			continue;
-		}
-		(diff || (diff = {}))[key] = b;
-	}
-	return diff;
-}
 
 function holds(collection, model) {
 	if (model.id != null) {

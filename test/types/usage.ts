@@ -103,6 +103,9 @@ async function run(): Promise<void> {
 
 	api.config({ methodOverride: { header: 'X-HTTP-Method-Override', methods: ['DELETE'], always: false }, methods: [{ name: 'closeAccount', delete: 'account', methodOverride: true }] });
 
+	const needed: boolean = api.preload().inspect().loaded.data;
+	console.log(needed);
+
 	api.session.reset({ resetCollections: true });
 	api.cache.invalidate('getTodo', { id: 1 });
 	const remove = api.use({ response: response => response });

@@ -764,7 +764,12 @@ declare namespace Reste {
 		identity: { get(name: string, id: any): any; clear(name?: string): void; size(name: string): number; sizes(): Record<string, number> };
 		modelConfig?: Record<string, ModelDefinition>;
 		/** Counts for finding leaks: requests in flight, cached responses, compiled URL variants, identity maps. */
-		inspect(): { inFlight: number; shared: number; cache: number; variants: Record<string, number>; identity: Record<string, number> };
+		inspect(): { inFlight: number; shared: number; cache: number; variants: Record<string, number>; identity: Record<string, number>; loaded: { data: boolean } };
+		/**
+		 * Loads what is otherwise loaded on first use (models, collections, lists, pagination; in the two-file
+		 * build: the second file). Call it in a quiet moment so the first list does not pay for it.
+		 */
+		preload(): this;
 	}
 
 	/**

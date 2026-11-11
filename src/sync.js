@@ -1,7 +1,8 @@
 'use strict';
 
 const { ResteError } = require('./errors');
-const { createMerger, diffAttributes, isCoalesced, touch } = require('./merge');
+const { diffAttributes, replaceAttributes } = require('./attributes');
+const { createMerger, isCoalesced, touch } = require('./merge');
 const { createLiveList } = require('./list');
 const { createIdentityMap } = require('./identity');
 const { normalizePagination, createPager, readPage } = require('./pagination');
@@ -249,16 +250,6 @@ function createData(reste, state) {
 			}
 			throw error;
 		});
-	}
-
-	function replaceAttributes(model, next) {
-		const gone = Object.keys(model.attributes).filter(key => !has(next, key));
-		gone.forEach(key => model.unset(key));
-		const diff = diffAttributes(model.attributes, next);
-		if (diff) {
-			model.set(diff);
-		}
-		return model;
 	}
 
 	function transformOf(config) {

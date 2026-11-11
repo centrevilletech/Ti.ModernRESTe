@@ -405,9 +405,54 @@ async function longestBlock() {
 	report('merging 2000 items: total time', 'ms', null, median(samples.chunked, 'total'), 'chunk: 100 (timers add about 1 ms per chunk)');
 }
 
+// ---------------------------------------------------------------- loading the library
+
+const vm = require('vm');
+let fresh = 0;
+
+/**
+ * Loads a CommonJS file the way a cold start does: its text is compiled and run as a new module every time
+ * (a comment makes each text unique, so the engine has nothing cached). './reste.data' resolves to the second
+ * file of the two-file build, loaded the same way.
+ */
+function coldRequire(file) {
+	const source = fs.readFileSync(file, 'utf8') + '\n// ' + (++fresh);
+	const script = new vm.Script('(function (module, exports, require) {' + source + '\n})', { filename: 'cold-' + fresh + '.js' });
+	const loaded = { exports: {} };
+	script.runInThisContext()(loaded, loaded.exports, name => (name === './reste.data' ? coldRequire(path.join(path.dirname(file), 'reste.data.js')) : require(name)));
+	return loaded.exports;
+}
+
+function loading() {
+	const upstreamFile = path.join(os.tmpdir(), 'reste-upstream-' + UPSTREAM_REF + '.js');
+	const single = path.join(root, 'reste.js');
+	const split = path.join(root, 'split', 'reste.js');
+	const methods = endpoints(20);
+	const firstRequest = (file) => {
+		const Reste = coldRequire(file);
+		const api = new Reste();
+		api.config({ url: 'https://api.test/', methods });
+		api[methods[0].name]({}, () => {}, () => {});
+		return api;
+	};
+	const firstMerge = (file) => {
+		const api = firstRequest(file);
+		api.upsert(new (require('backbone-1.4.0').Collection)(), [{ id: 1 }]);
+	};
+	report('load the library (compile and run its file)', 'ms', time(() => coldRequire(upstreamFile), 60), time(() => coldRequire(single), 60),
+		'the one-file build: ' + Math.round(fs.statSync(single).size / 1024) + ' kB against ' + Math.round(fs.statSync(upstreamFile).size / 1024) + ' kB');
+	report('load the library, two-file build', 'ms', null, time(() => coldRequire(split), 60),
+		'models, collections, lists and pagination stay in the second file until first used');
+	report('load, config() with 20 endpoints, first request', 'ms', time(() => firstRequest(upstreamFile), 60), time(() => firstRequest(single), 60), 'a cold start, one-file build');
+	report('load, config() with 20 endpoints, first request, two-file build', 'ms', null, time(() => firstRequest(split), 60), 'a cold start that only sends requests');
+	report('the same, then the first merge into a collection', 'ms', null, time(() => firstMerge(single), 60), 'one-file build');
+	report('the same, then the first merge, two-file build', 'ms', null, time(() => firstMerge(split), 60), 'reads the second file');
+}
+
 // ---------------------------------------------------------------- output
 
 async function main() {
+	loading();
 	await collections('1.4.0');
 	await collections('0.9.2');
 	await longestBlock();

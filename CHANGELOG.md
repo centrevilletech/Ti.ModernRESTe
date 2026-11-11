@@ -4,6 +4,13 @@
 
 ### Added
 
+- A two-file build in `split/`: `reste.js` without models, collections,
+  lists and pagination, and `reste.data.js`, read from the same folder when
+  one of them is first used. A cold start that only sends requests loads a
+  little over half of the code
+- `api.preload()` loads that part ahead of time; `api.inspect().loaded.data`
+  says whether an instance has needed it
+
 - A status hook can answer `false`: the response was not its event (one
   status used for two things), and the firing does not swallow the next
   response with that status
@@ -29,6 +36,10 @@
   in an app's own format, one per exchange, or to keep request timings
 
 ### Changed
+
+- Models, collections, lists and pagination are set up on first use instead
+  of in the constructor, in every build; `api.replace()` on a model the app
+  made itself does not need them
 
 - `mapError` is also asked about cancelled and stale requests, so a call
   rejects with the app's own error class whatever happened to it. Callbacks,

@@ -79,8 +79,10 @@ Measured against upstream master (see [Performance](#performance)): a 500-item
 list is handled about 1.5 times faster, a collection that did not change 4 to
 9 times faster, and a bound list is rendered once per update instead of once
 per row. What got slower: a single small request costs 3 to 4 microseconds
-more than before, and defining and first calling methods about a millisecond
-more per app start.
+more than before, defining and first calling methods about a millisecond more
+per app start, and the file itself, thirteen times the size of upstream's,
+takes several milliseconds longer to load (the two-file build takes about
+half of that off a cold start).
 
 ## Install
 
@@ -101,6 +103,16 @@ cd app/lib && npm install @centrevilletech/reste
 const Reste = require('reste');                    // the file in app/lib
 const Reste = require('@centrevilletech/reste');   // the npm package
 ```
+
+The file is about 200 kB, and on a phone a JavaScript file costs time to
+read and compile before any of it runs. If the milliseconds of a cold start
+matter to you, copy the two files in
+[`split/`](https://github.com/centrevilletech/Ti.ModernRESTe/tree/HEAD/split)
+instead: `reste.js`, the same library without models, collections, lists and
+pagination, and `reste.data.js`, which it reads from the same folder the first
+time one of those is used. Nothing else differs, and `api.preload()` reads the
+second file whenever the app has a quiet moment. See
+[Performance](#performance) for what it saves.
 
 TypeScript declarations are in `reste.d.ts`: `new Reste<{ getArticles: Article[] }>()` types the methods you name
 and makes a misspelt one an error; without the type argument every name is a
@@ -210,7 +222,7 @@ Callbacks receive `(data, response)`.
 Instance members: `config`, `setUrl`, `getUrl`, `clearCookies`,
 `setRequestHeaders`, `changeRequestHeader`, `removeRequestHeaderItem`,
 `getRequestHeaders`, `addMethod`, `removeMethod`, `hasMethod`, `request`,
-`use`, `paginate`, `list`, `upsert`, `replace`, `optimistic`, `session`,
+`use`, `paginate`, `list`, `upsert`, `replace`, `optimistic`, `preload`, `session`,
 `cache`, `idempotency`, `abortAll`, `createAbortController`, `addModel`,
 `createModel`, `createCollection`, `model`, `collections`, `models`,
 `identity`, `inspect`. A method may not be named after
@@ -1148,6 +1160,10 @@ the range between them:
 
 | Measurement | upstream | 2.0 | |
 | --- | --- | --- | --- |
+| loading the library: compiling and running its file | 0.9 ms | 6.5 to 7.5 ms | 206 kB against 16 kB. On an Android emulator (Titanium 13.4.1, desktop CPU) upstream's `require` takes about 1 ms and this one 8 to 10 ms |
+| the same, two-file build | | 4.2 to 5.5 ms | models, collections, lists and pagination stay in the second file until they are used |
+| load, `config()` with 20 methods, first request | 3.2 to 4.4 ms | 9.0 to 9.7 ms | a cold start |
+| the same, two-file build | | 5.8 to 8.1 ms | a cold start that only sends requests |
 | `config()` with 500 methods | 0.6 to 0.7 ms | 0.7 to 1.3 ms | 2.0 analyses a method on its first call |
 | `config()` with 500 methods, then the first call of 20 of them | 0.8 to 0.9 ms | 1.7 to 2.0 ms | what an app start pays: about twice upstream, a millisecond more |
 | one GET, small JSON, callbacks | 3.7 to 4.3 µs | 6.7 to 8.7 µs | the promise, its handle and the response object: 3.4 kB allocated per request against 2.3 kB |
@@ -1166,7 +1182,11 @@ The fixed costs went up: a request costs about twice upstream's (3 to 4
 microseconds and a kilobyte more), and so does defining methods and calling
 them for the first time. Both are far below the cost of the HTTP exchange
 they belong to; what an app notices is the work
-per list, and the renders. JavaScript in Titanium runs on one thread, so a
+per list, and the renders. The one cost that is paid before anything happens
+is loading the file. Nearly all of it is the engine reading and compiling
+200 kB; running the library's own start-up code is a small part. So nothing
+of the models, collections, lists and pagination is set up until it is used,
+and the two-file build keeps their code out of the cold start altogether. JavaScript in Titanium runs on one thread, so a
 response cannot be parsed off it; what 2.0 does instead is parse once, not at
 all when the server says (or the bytes show) that nothing changed, and merge
 in chunks when asked.
@@ -1177,14 +1197,14 @@ The example app prints the same measurements on a device (`RESTE-BENCH` lines).
 
 Verified by running, not only by unit tests:
 
-- **Node**: `npm test` runs the suite against the sources and against the
-  built `reste.js`: 834 tests each time. Many of them are the same test
+- **Node**: `npm test` runs the suite against the sources, the built
+  `reste.js` and the two-file build: 841 tests each time. Many of them are the same test
   repeated on each Backbone version Alloy ships (0.9.2, 1.1.2, 1.3.3, 1.4.0,
-  1.6.0); there are 396 distinct tests. They cover the request pipeline on a
+  1.6.0); there are 403 distinct tests. They cover the request pipeline on a
   scripted HTTP client, models and collections, an integration suite over real
   sockets against `test/server/server.js`, and 62 scenarios from upstream's
   README run against upstream and this build side by side.
-- **Mutation check**: `npm run mutate` breaks 58 safety-relevant lines one at
+- **Mutation check**: `npm run mutate` breaks 61 safety-relevant lines one at
   a time (what may be retried, what a session reset drops, what the log
   prints, what the cache keeps); every one makes a test fail.
 - **Android**: Titanium SDK 13.4.1.GA, Alloy 3.0.1, Android 15 (API 35, x86_64
@@ -1207,7 +1227,7 @@ versions other than 1.4.0 on a device (Node covers all five).
 
 ```bash
 npm install
-npm test            # build, then the suite against src/ and against reste.js
+npm test            # build, then the suite against src/, reste.js and split/
 npm run lint
 npm run types       # type-check reste.d.ts against a usage sample
 npm run mutate      # break safety-relevant lines one by one; every break must fail a test
@@ -1215,8 +1235,9 @@ npm run bench
 npm run server      # the test server on :8787, for the example app
 ```
 
-Sources are in `src/`; `reste.js` is generated by `npm run build` and
-committed, so the repository always holds the file people copy. The example
+Sources are in `src/`; `reste.js` and the two files in `split/` are generated
+by `npm run build` and committed, so the repository always holds the files
+people copy. The example
 app and how to run its checks are described in
 [example/README.md](https://github.com/centrevilletech/Ti.ModernRESTe/blob/HEAD/example/README.md).
 

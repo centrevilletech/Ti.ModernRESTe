@@ -91,6 +91,48 @@
 
 		module.exports = { createAbortController, watchSignal };
 	},
+	"./attributes": function (module, exports, require) {
+		const { deepEqual, isObject, has } = require('./util');
+
+		/**
+		 * The attributes of `incoming` that differ from `current`, or null when none do. Keys `incoming` lacks are
+		 * left alone: a list row usually carries fewer fields than the detail of the same resource. `pending` names
+		 * attributes to leave alone as well (optimistic changes in flight).
+		 */
+		function diffAttributes(current, incoming, pending) {
+			let diff = null;
+			const keys = Object.keys(incoming);
+			for (let i = 0; i < keys.length; i++) {
+				const key = keys[i];
+				if (pending && pending[key] > 0) {
+					continue; // changed on the device, not answered by the server yet: the device's value stands
+				}
+				const a = current[key];
+				const b = incoming[key];
+				if (a === b) {
+					continue;
+				}
+				if (isObject(a) && isObject(b) && deepEqual(a, b)) {
+					continue;
+				}
+				(diff || (diff = {}))[key] = b;
+			}
+			return diff;
+		}
+
+		/** Makes a Backbone model hold exactly `next`: keys it lacks are removed; only real changes fire. */
+		function replaceAttributes(model, next) {
+			const gone = Object.keys(model.attributes).filter(key => !has(next, key));
+			gone.forEach(key => model.unset(key));
+			const diff = diffAttributes(model.attributes, next);
+			if (diff) {
+				model.set(diff);
+			}
+			return model;
+		}
+
+		module.exports = { diffAttributes, replaceAttributes };
+	},
 	"./cache": function (module, exports, require) {
 		const { isFunction, isPlainObject, hashString, now: clock } = require('./util');
 
@@ -2284,9 +2326,8 @@
 		const { normalizeRetry } = require('./retry');
 		const { createKeys } = require('./idempotency');
 		const { createCache, normalizeCachePolicy, propertiesStore, fileStore } = require('./cache');
-		const { normalizePagination, createPager } = require('./pagination');
 		const { createPipeline } = require('./client');
-		const { createData } = require('./sync');
+		const { replaceAttributes } = require('./attributes');
 		const { isFunction, isObject, isPlainObject, has, uuid } = require('./util');
 
 		const VERSION = '2.0.0';
@@ -2337,7 +2378,6 @@
 				cacheScope: null,
 				authStatuses: [401],
 				methodOverride: null,
-				pagination: null,
 				cache: createCache({}),
 				keys: createKeys(uuid),
 				interceptors: { request: [], response: [], error: [] },
@@ -2358,7 +2398,33 @@
 			const records = new Map(); // method name -> { def, endpoint }
 			const adhoc = typeof WeakMap === 'function' ? new WeakMap() : null;
 			const pipeline = createPipeline(state);
-			const data = createData(reste, state);
+
+			// Models, collections, lists and pagination are a good third of the library and many apps only send
+			// requests: that part is loaded (in the two-file build: its file is read) when something first needs it.
+			let dataLayer = null;
+			let paginationDefaults; // undefined: not worked out yet
+			let pagers = false;
+
+			function data() {
+				return dataLayer || (dataLayer = require('./sync').createData(reste, state));
+			}
+
+			function pagination() {
+				pagers = true;
+				return require('./pagination');
+			}
+
+			Object.defineProperty(state, 'pagination', {
+				enumerable: true,
+				get() {
+					if (paginationDefaults === undefined) {
+						const configured = state.config.pagination;
+						paginationDefaults = configured === undefined || configured === null || configured === false ? null
+							: pagination().normalizePagination(configured, null);
+					}
+					return paginationDefaults;
+				}
+			});
 
 			// ------------------------------------------------------------------ endpoints
 
@@ -2385,7 +2451,8 @@
 				const dynamic = isFunction(source);
 				const template = compileTemplate(dynamic ? '' : String(source === undefined ? '' : source));
 				const retry = def.retry === undefined ? state.retry : normalizeRetry(def.retry, state.retry);
-				return {
+				let paginate; // worked out when a pager, a list or a collection asks for it
+				const endpoint = {
 					name: def.name || method + ' ' + template.source,
 					def,
 					method,
@@ -2417,7 +2484,6 @@
 					responseType: def.responseType,
 					unwrap: def.unwrap,
 					meta: def.meta,
-					paginate: normalizePagination(def.paginate, state.pagination),
 					fullResponse: def.fullResponse,
 					session: def.session,
 					methodOverride: normalizeOverride(def.methodOverride, state.methodOverride),
@@ -2427,6 +2493,17 @@
 					clientOptions: def.clientOptions,
 					securityManager: def.securityManager
 				};
+				Object.defineProperty(endpoint, 'paginate', {
+					enumerable: true,
+					get() {
+						if (paginate === undefined) {
+							const none = (def.paginate === undefined || def.paginate === null) && (config.pagination === undefined || config.pagination === null);
+							paginate = none ? null : pagination().normalizePagination(def.paginate, state.pagination);
+						}
+						return paginate;
+					}
+				});
+				return endpoint;
 			}
 
 			function endpointOf(name) {
@@ -2544,7 +2621,7 @@
 				state.logger = createLogger(config);
 				state.queryOptions = config.query ? Object.assign({}, DEFAULT_QUERY_OPTIONS, config.query) : DEFAULT_QUERY_OPTIONS;
 				state.retry = normalizeRetry(config.retry, null);
-				state.pagination = normalizePagination(config.pagination, null);
+				paginationDefaults = undefined;
 				state.factory = isFunction(config.httpClient) ? config.httpClient : null;
 				state.random = isFunction(config.random) ? config.random : null;
 
@@ -2740,7 +2817,9 @@
 					if (settings.clearCache !== false) {
 						state.cache.clear();
 					}
-					data.reset(settings);
+					if (dataLayer) {
+						dataLayer.reset(settings);
+					}
 					return state.generation;
 				}
 			};
@@ -2803,9 +2882,9 @@
 				if (!endpoint) {
 					throw new Error('RESTe :: unknown method ' + name);
 				}
-				const pagination = normalizePagination(settings.paginate === undefined ? true : settings.paginate, endpoint.paginate || state.pagination);
+				const paging = pagination().normalizePagination(settings.paginate === undefined ? true : settings.paginate, endpoint.paginate || state.pagination);
 				const requestOptions = Object.assign({}, settings.request, { fullResponse: true });
-				return createPager(pagination, settings, (query) => {
+				return pagination().createPager(paging, settings, (query) => {
 					const params = Object.assign({}, settings.params);
 					params.query = Object.assign({}, settings.query, query);
 					return state.call(name, params, requestOptions);
@@ -2813,20 +2892,20 @@
 			};
 
 			reste.addModel = function (args) {
-				return data.addModel(args);
+				return data().addModel(args);
 			};
 
 			reste.createModel = function (name, attributes) {
-				return data.createModel(name, attributes);
+				return data().createModel(name, attributes);
 			};
 
 			reste.createCollection = function (name, content) {
-				return data.createCollection(name, content);
+				return data().createCollection(name, content);
 			};
 
 			/** The instance for an id of an `identity` model (created empty when not known yet). */
 			reste.model = function (name, id) {
-				return data.modelFor(name, id);
+				return data().modelFor(name, id);
 			};
 
 			/**
@@ -2835,7 +2914,7 @@
 			 * own `load(query, { signal })`. See the README, "Lists that follow a collection".
 			 */
 			reste.list = function (options) {
-				return data.liveList(options);
+				return data().liveList(options);
 			};
 
 			/**
@@ -2843,15 +2922,26 @@
 			 * models and collections the app created itself as well as RESTe's own.
 			 */
 			reste.upsert = function (collection, items, options) {
-				return data.upsert(collection, items, options);
+				return data().upsert(collection, items, options);
 			};
 
 			reste.replace = function (model, attributes) {
-				return data.replace(model, attributes);
+				// A model of the app's own needs nothing of the data layer; one of RESTe's exists only once that is loaded.
+				return dataLayer ? dataLayer.replace(model, attributes) : replaceAttributes(model, attributes || {});
+			};
+
+			/**
+			 * Loads what is otherwise loaded on first use (models, collections, lists, pagination). Call it when the
+			 * app has a quiet moment, so the first list does not pay for it.
+			 */
+			reste.preload = function () {
+				data();
+				pagination();
+				return reste;
 			};
 
 			reste.optimistic = function (target, attributes, send, options) {
-				return data.optimistic(target, attributes, send, options);
+				return data().optimistic(target, attributes, send, options);
 			};
 
 			/** Numbers for finding leaks: what is in flight, cached and kept per method and per model. */
@@ -2862,12 +2952,18 @@
 						variants[name] = record.variants.size;
 					}
 				});
-				return { inFlight: state.active.size, shared: state.inflight.size, cache: state.cache.size, variants, identity: data.identity.sizes() };
+				return {
+					inFlight: state.active.size, shared: state.inflight.size, cache: state.cache.size, variants,
+					identity: dataLayer ? dataLayer.identity.sizes() : {},
+					loaded: { data: Boolean(dataLayer) || pagers } // whether this instance has needed models, collections, lists or pagers
+				};
 			};
 
-			reste.collections = data.collections;
 			reste.models = state.models;
-			reste.identity = data.identity;
+			Object.defineProperties(reste, {
+				collections: { enumerable: true, configurable: true, get: () => data().collections },
+				identity: { enumerable: true, configurable: true, get: () => data().identity }
+			});
 
 			return reste;
 		}
@@ -3468,34 +3564,9 @@
 		module.exports = { createLogger, REDACTED };
 	},
 	"./merge": function (module, exports, require) {
-		const { deepEqual, isObject, isFunction, later } = require('./util');
+		const { isFunction, later } = require('./util');
+		const { diffAttributes } = require('./attributes');
 		const { ResteError } = require('./errors');
-
-		/**
-		 * The attributes of `incoming` that differ from `current`, or null when none do. Keys `incoming` lacks are
-		 * left alone: a list row usually carries fewer fields than the detail of the same resource. `pending` names
-		 * attributes to leave alone as well (optimistic changes in flight).
-		 */
-		function diffAttributes(current, incoming, pending) {
-			let diff = null;
-			const keys = Object.keys(incoming);
-			for (let i = 0; i < keys.length; i++) {
-				const key = keys[i];
-				if (pending && pending[key] > 0) {
-					continue; // changed on the device, not answered by the server yet: the device's value stands
-				}
-				const a = current[key];
-				const b = incoming[key];
-				if (a === b) {
-					continue;
-				}
-				if (isObject(a) && isObject(b) && deepEqual(a, b)) {
-					continue;
-				}
-				(diff || (diff = {}))[key] = b;
-			}
-			return diff;
-		}
 
 		function holds(collection, model) {
 			if (model.id != null) {
@@ -4246,7 +4317,8 @@
 	},
 	"./sync": function (module, exports, require) {
 		const { ResteError } = require('./errors');
-		const { createMerger, diffAttributes, isCoalesced, touch } = require('./merge');
+		const { diffAttributes, replaceAttributes } = require('./attributes');
+		const { createMerger, isCoalesced, touch } = require('./merge');
 		const { createLiveList } = require('./list');
 		const { createIdentityMap } = require('./identity');
 		const { normalizePagination, createPager, readPage } = require('./pagination');
@@ -4494,16 +4566,6 @@
 					}
 					throw error;
 				});
-			}
-
-			function replaceAttributes(model, next) {
-				const gone = Object.keys(model.attributes).filter(key => !has(next, key));
-				gone.forEach(key => model.unset(key));
-				const diff = diffAttributes(model.attributes, next);
-				if (diff) {
-					model.set(diff);
-				}
-				return model;
 			}
 
 			function transformOf(config) {

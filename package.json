@@ -6,6 +6,7 @@
   "types": "reste.d.ts",
   "files": [
     "reste.js",
+    "split/",
     "reste.d.ts",
     "README.md",
     "CHANGELOG.md",
@@ -15,7 +16,7 @@
   "scripts": {
     "build": "node scripts/build.js",
     "lint": "eslint .",
-    "test": "node scripts/build.js && node --test \"test/unit/*.test.js\" \"test/integration/*.test.js\" && RESTE_ENTRY=bundle node --test \"test/unit/*.test.js\" \"test/integration/*.test.js\"",
+    "test": "node scripts/build.js && node --test \"test/unit/*.test.js\" \"test/integration/*.test.js\" && RESTE_ENTRY=bundle node --test \"test/unit/*.test.js\" \"test/integration/*.test.js\" && RESTE_ENTRY=split node --test \"test/unit/*.test.js\" \"test/integration/*.test.js\"",
     "test:src": "node --test \"test/unit/*.test.js\" \"test/integration/*.test.js\"",
     "types": "tsc -p test/types",
     "bench": "node --expose-gc bench/run.js",

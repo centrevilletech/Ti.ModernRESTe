@@ -2,10 +2,11 @@
 'use strict';
 
 /**
- * Builds the single file people drop into app/lib: src/*.js -> reste.js.
+ * Builds what people drop into app/lib: src/*.js -> reste.js (one file with everything), and the same
+ * library as two files under split/ for apps that count the milliseconds of a cold start.
  *
- *   node scripts/build.js           write reste.js
- *   node scripts/build.js --check   exit 1 when reste.js is not what the sources produce
+ *   node scripts/build.js           write reste.js, split/reste.js and split/reste.data.js
+ *   node scripts/build.js --check   exit 1 when one of them is not what the sources produce
  *
  * No bundler: every source file becomes one function in a small module table. The order of the table does
  * not matter, modules are evaluated on first require.
@@ -15,7 +16,6 @@ const path = require('path');
 
 const root = path.join(__dirname, '..');
 const sourceDir = path.join(root, 'src');
-const target = path.join(root, 'reste.js');
 const version = require(path.join(root, 'package.json')).version;
 
 const HEADER = `/*!
@@ -42,24 +42,47 @@ const HEADER = `/*!
  */
 `;
 
-function build() {
-	const files = fs.readdirSync(sourceDir).filter(file => file.endsWith('.js')).sort();
-	const modules = files.map((file) => {
-		const name = './' + file.replace(/\.js$/, '');
-		const source = fs.readFileSync(path.join(sourceDir, file), 'utf8').replace(/^'use strict';\n+/, '');
+/** The part that is loaded on first use; in the two-file build it is the second file. */
+const DATA = ['./identity', './list', './merge', './pagination', './sync'];
+
+function moduleTable(names) {
+	return names.map((name) => {
+		const source = fs.readFileSync(path.join(sourceDir, name.slice(2) + '.js'), 'utf8').replace(/^'use strict';\n+/, '');
 		const body = source.split('\n').map(line => (line ? '\t\t' + line : line)).join('\n').replace(/\s+$/, '');
 		return `\t${JSON.stringify(name)}: function (module, exports, require) {\n${body}\n\t}`;
+	}).join(',\n');
+}
+
+/**
+ * Everything the build writes, by path relative to the repository:
+ *   reste.js                 the one file with everything (the default: copy it into app/lib)
+ *   split/reste.js           the same library without models, collections, lists and pagination ...
+ *   split/reste.data.js      ... which it reads from this file, next to it, when they are first needed
+ */
+function build() {
+	const names = fs.readdirSync(sourceDir).filter(file => file.endsWith('.js')).sort().map(file => './' + file.replace(/\.js$/, ''));
+	DATA.forEach((name) => {
+		if (names.indexOf(name) === -1) {
+			throw new Error('scripts/build.js: no source for ' + name);
+		}
 	});
-	return `${HEADER}(function () {
+	const loader = second => `(function () {
 	'use strict';
 
 	var cache = {};
 	var modules = {
-${modules.join(',\n')}
+${moduleTable(second ? names.filter(name => DATA.indexOf(name) === -1) : names)}
 	};
 
 	function load(name) {
-		if (!cache[name]) {
+		if (!cache[name]) {${second ? `
+			if (!modules[name]) {
+				// Models, collections, lists and pagination: the second file, read when one of them is first needed.
+				var more = require('./reste.data');
+				Object.keys(more).forEach(function (key) {
+					modules[key] = more[key];
+				});
+			}` : ''}
 			var loaded = cache[name] = { exports: {} };
 			modules[name](loaded, loaded.exports, load);
 		}
@@ -69,17 +92,34 @@ ${modules.join(',\n')}
 	module.exports = load('./index');
 }());
 `;
+	return {
+		'reste.js': HEADER + loader(false),
+		'split/reste.js': HEADER + loader(true),
+		'split/reste.data.js': `${HEADER}'use strict';
+
+// The second file of the two-file build: reste.js, next to it, reads it on first use. Not for use on its own.
+module.exports = {
+${moduleTable(DATA)}
+};
+`
+	};
 }
 
-const output = build();
+const outputs = build();
+const stale = Object.keys(outputs).filter((file) => {
+	const target = path.join(root, file);
+	return !fs.existsSync(target) || fs.readFileSync(target, 'utf8') !== outputs[file];
+});
 if (process.argv.includes('--check')) {
-	const current = fs.existsSync(target) ? fs.readFileSync(target, 'utf8') : '';
-	if (current !== output) {
-		console.error('reste.js is out of date: run `npm run build`');
+	if (stale.length) {
+		console.error(stale.join(', ') + ' out of date: run `npm run build`');
 		process.exit(1);
 	}
-	console.log('reste.js is up to date');
+	console.log(Object.keys(outputs).join(', ') + ' up to date');
 } else {
-	fs.writeFileSync(target, output);
-	console.log('wrote reste.js (' + (output.length / 1024).toFixed(1) + ' kB, ' + output.split('\n').length + ' lines)');
+	Object.keys(outputs).forEach((file) => {
+		fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+		fs.writeFileSync(path.join(root, file), outputs[file]);
+		console.log('wrote ' + file + ' (' + (outputs[file].length / 1024).toFixed(1) + ' kB, ' + outputs[file].split('\n').length + ' lines)');
+	});
 }
