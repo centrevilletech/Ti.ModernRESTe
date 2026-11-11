@@ -20,48 +20,70 @@ places where behaviour changed.
   `parse`, `params`, `config`), status, parsed body, headers, `Retry-After`;
   `mapError` to turn it into an app's own error class
 - `onStatus` hooks that fire once per event and can answer `'retry'` (token
-  refresh)
+  refresh): every request is sent again after a 401 (`authStatuses`), only
+  repeatable ones after any other status
 - Retry policy: exponential back-off with jitter, `Retry-After`, only for
-  requests that are safe to repeat
+  requests that are safe to repeat (GET / HEAD, a request with an idempotency
+  key, a method defined with `retry`); nothing at the call site can make an
+  unsafe request repeatable
 - Idempotency keys: per call, reused across retries; per named user action
-- HTTP cache: ETag / `If-None-Match`, `Cache-Control`, ttl,
-  stale-while-revalidate, stale-if-error, invalidation, memory with LRU
-  eviction, optional persistent store (`Reste.fileStore`,
-  `Reste.propertiesStore`)
+- HTTP cache: ETag / `If-None-Match`, `Cache-Control`, `Vary`, ttl,
+  stale-while-revalidate, stale-if-error, memory with LRU eviction, optional
+  persistent store (`Reste.fileStore`, `Reste.propertiesStore`), a `scope` per
+  user; invalidation that also covers requests in flight and entries a
+  previous launch persisted; only the body and four headers are persisted, and
+  nothing that varies on a credential header
 - Pagination: page / per_page and cursor styles with configurable extractors;
   `api.paginate()`; `fetchNext()`, `fetchPrevious()`, `refresh()`, `hasMore()`,
   `paging` and `meta` on collections
 - Collections merged in place on every Backbone version Alloy ships:
   `fetch({ merge: true })`, `upsert()`, chunked merges, one render of a bound
   list per merge, no work when nothing changed
-- `identity`: one model instance per id across collections; `api.model()`
+- `identity`: one model instance per id across collections, held weakly
+  where the engine has `WeakRef` and bounded otherwise; `api.model()`
 - Optimistic `save`, `destroy` and `create` with rollback;
-  `model.optimistic()` and `collection.optimistic()` for any request
+  `model.optimistic()` and `collection.optimistic()` for any request; a list
+  response requested before an optimistic write does not undo it
 - `api.list()`: a filtered, paginated list that follows a collection
 - Multipart uploads with `Ti.Blob` / files and mixed fields, upload and
   download progress (reported in steps), download to a file
 - Interceptors (`request`, `response`, `error`), globally, per method, per call
-- `session.reset()`: responses of the previous session are dropped
+- `session.reset()`: responses of the previous session are dropped, requests
+  waiting to be retried are not sent with the next session's credentials, and
+  the cache, identity maps and paging state start over
 - In-flight de-duplication of identical GETs
-- A debug logger that redacts credentials; `logger` and `redact` options
+- A debug logger that replaces the values of headers, body fields, query
+  parameters and path placeholders whose name looks like a credential;
+  `logger` and `redact` options
 - `request()`, `use()`, `abortAll()`, `removeMethod()`, `hasMethod()`,
-  `getRequestHeaders()`, function URLs, `{ method, url }` definitions, `head`
+  `getRequestHeaders()`, `inspect()`, function URLs, `{ method, url }`
+  definitions, `head`
 - TypeScript declarations
-- A test suite, a benchmark against upstream, an example app with on-device
-  checks
+- A test suite (including 62 scenarios from upstream's README run side by
+  side against upstream and this build), a mutation check, a benchmark against
+  upstream, an example app with on-device checks
 
 ### Changed
 
 - Sync is scoped to RESTe's models and collections; `Backbone.sync` is no
   longer replaced
-- `errorsAsObjects` defaults to `true`, as 1.x announced
+- `errorsAsObjects` defaults to `true`, as 1.x announced; `error.url` is the
+  full URL
 - Path values are URI-encoded (`encodeParams: false` to opt out)
-- A missing path parameter rejects the call instead of being sent as `<name>`
+- A missing path parameter rejects the call instead of being sent as `<name>`;
+  so does an empty string in the path (not in the query string)
 - An error with no handler is logged instead of being passed to the success
-  callback (`errorsToOnLoad: true` to opt back in)
+  callback (`errorsToOnLoad: true` to opt back in; with `errorsAsObjects:
+  false` the 1.x behaviour stays)
+- Default headers are sent to the base URL's origin only; a method with a full
+  URL elsewhere opts in with `globalHeaders: true`
+- An empty response body is `null`, not `''`; invalid JSON served as JSON is
+  an error
+- Nested values of a form-encoded body are flattened to `name[child]`
 - `beforePost` and `beforeSend` both run for a POST, as documented
 - A string body is sent as it is
-- `destroy()` sends no body unless `beforeDelete` returns one
+- `destroy()` sends no body unless `beforeDelete` returns one, and a DELETE
+  without a body sends none (upstream master sent `{}`; 1.6.0 did neither)
 - A call returns a promise with `abort()` instead of the HTTP client
 - A JSON body gets `Content-Type: application/json` when no content type is set
 - Method definitions are analysed on first call; `config()` can be called again
@@ -85,6 +107,12 @@ places where behaviour changed.
   configured `content`, was a `TypeError`
 - `sync` fired twice per fetch on Backbone 1.x
 - A second instance with models broke the first
+- Models whose `id` setting names another attribute: unchanged from 1.x (the
+  model's id is `id`, the configured attribute is copied into it), and now
+  also when a model is made or added with only that attribute
+- A header function, `beforeSend` / `beforePost` hook or interceptor that
+  throws rejects the call instead of throwing out of it (or, on a retry, out
+  of a timer)
 - `changeRequestHeader` ignored all but the first key
 - Header functions were called twice, and their values logged
 

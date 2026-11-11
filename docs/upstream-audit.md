@@ -71,7 +71,7 @@ Each has a test; the file is under `test/unit/` unless stated.
 | 10 | Function header values are called twice (once to set, once to log), and logged | called once; the log redacts | `requests`, `pipeline`: "never prints credentials" |
 | 11 | `changeRequestHeader({ a, b })` only applies the first key | all keys | `requests` |
 | 12 | `args.url.indexOf('http') == 0` treats a relative path such as `httpstatus/200` as absolute | scheme test | `url`, `requests` |
-| 13 | Global headers are sent to methods with a full URL although the README says they are not (a token can reach a third party) | kept for compatibility; `globalHeaders: false` per method, documented | `requests`: "can keep default headers away from one method" |
+| 13 | Global headers are sent to methods with a full URL although the README says they are not: a bearer token reaches a storage or maps host | default headers go to the base URL's origin only; `globalHeaders: true` per method opts in | `requests`: "default headers stay on the API's origin" |
 | 14 | `clearCookies` is defined inside the first request and closes over that request's client | defined on the instance | `requests` |
 | 15 | `config()` requires `methods`; a second `config()` throws "already defined" | optional; reconfigurable | `requests`: "configuration" |
 | 16 | No body can be sent except JSON or a flat form: a `Ti.Blob` is `JSON.stringify`-ed (issues 34, 43, 72) | multipart, with flattening of arrays and nested fields | `upload`, integration |
@@ -82,7 +82,7 @@ Each has a test; the file is under `test/unit/` unless stated.
 | 21 | A method's `onError` replaces the caller's and receives the success callback as its second argument although the README documents `(e, callback, globalOnError)`; the `retry` function is lost | precedence kept; third argument is `retry` | `compat` |
 | 22 | `retry()` re-runs the request with the body `beforeSend` already transformed, and the client it creates cannot be aborted by the caller | re-runs from the original params; returns a handle | `compat`: "hooks see the original body again" |
 | 23 | `beforePost` and `beforeSend` are exclusive for a POST; the README says both run | both run | `compat` |
-| 24 | `{ skip: true }` calls `onLoad` unconditionally: a `TypeError` in promise style | resolves with the value | `compat` |
+| 24 | `{ skip: true }` calls `onLoad` without checking that there is one: a `TypeError` when the call was made without a success callback (with one, it works) | the value goes to the callback if there is one, and resolves the promise | `compat`: "{ skip: true } stops the request" |
 | 25 | A string body is JSON-encoded | sent as it is | `requests` |
 | 26 | `log(args.params)` prints `[object Object]`; debug logs bodies and tokens | structured, redacted | `pipeline` |
 | 27 | No way to cancel before the request is sent, or a retried one; a timeout and a dropped connection cannot be told apart | `abort()` at any point; `kind` | `abort`, `errors` |
@@ -92,7 +92,7 @@ Each has a test; the file is under `test/unit/` unless stated.
 | # | Defect | Fix | Test |
 | --- | --- | --- | --- |
 | 28 | `Backbone.sync` is replaced for the whole app | scoped `sync` per model class and collection | `sync`: "leaves Backbone.sync alone" |
-| 29 | A second instance with models replaces the first one's `Backbone.sync`: the first one's fetches fail with a `TypeError` (issues 12, 53) | instances are independent | `sync`: "two instances with models do not break each other" |
+| 29 | A second instance with models replaces the first one's `Backbone.sync`. A fetch of the first instance's collection then looks its model up in the second instance's config, finds nothing, and does nothing at all: no request, no `success`, no `error`; a model `save` of the first instance throws a `TypeError` (issues 12, 53) | instances are independent | `sync`: "two instances with models do not break each other" |
 | 30 | `beforeCreate` is called on delete and `beforeDelete` on create | each on its own operation | `sync`: "create: ... runs beforeCreate" |
 | 31 | `if (e.code > 200) onError(e)` on success responses: a body with a `code` field is an error, and `onError` may be `null` | the HTTP status decides | `sync`: "does not mistake a code field" |
 | 32 | `item.id = item[modelConfig.id]` overwrites a real `id` with `undefined` when the model has no `id` setting, and mutates the response | `idAttribute`; the copy only when ids differ | `sync`: "does not overwrite id" |
@@ -115,6 +115,15 @@ Each has a test; the file is under `test/unit/` unless stated.
 | 44 | iOS answers a conditional request whose server reply is 304 with the stored 200 | a 200 carrying the validator that was sent counts as not modified | `cache`; example: "ETag" |
 | 45 | Android fires a send-stream event every few hundred bytes (6145 for 3 MB) | progress is reported in steps | `upload`; example: "upload progress" |
 | 46 | Android does not keep the order of multipart fields | documented | example: "multipart upload" |
+
+### Compatibility checked mechanically
+
+`test/differential/` runs 62 scenarios from upstream's README against upstream
+(read out of this repository's history) and against this build, on Backbone
+0.9.2, 1.4.0 and 1.6.0, and compares the callbacks called, their arguments and
+the requests sent. `test/unit/differential.test.js` fails when a scenario
+differs without being listed there with its reason, and when a listed one no
+longer differs. That is how the README's migration table is kept complete.
 
 ## Limitations that became features
 
