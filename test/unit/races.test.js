@@ -332,6 +332,23 @@ eachBackbone((Backbone, version) => {
 			assert.deepEqual(articles.pluck('id').sort(), [1, 2, 3]);
 		});
 
+		it('a refresh does not drop a row that reached the collection while it was on its way', async () => {
+			ti.respond(() => ({ status: 200, body: list() }));
+			await articles.fetch();
+			articles.upsert({ id: 8, title: 'before the refresh was asked for' });
+			ti.respond(() => null);
+			const refresh = articles.refresh();
+			const pending = ti.last;
+			articles.upsert({ id: 9, title: 'from a socket, meanwhile' });
+			pending.respond({ status: 200, body: list() }); // made before 9 existed
+			await refresh;
+			assert.deepEqual(articles.pluck('id'), [1, 2, 9], 'the refresh dropped a row it could not know of');
+			// A refresh asked for afterwards is the server's word about it, also when it sends the same bytes.
+			ti.respond(() => ({ status: 200, body: list() }));
+			await articles.refresh();
+			assert.deepEqual(articles.pluck('id'), [1, 2]);
+		});
+
 		it('a chunked refresh does not bring back a row destroyed between its chunks', async () => {
 			const many = Array.from({ length: 30 }, (unused, index) => ({ id: index + 1 }));
 			ti.respond(() => ({ status: 200, body: many }));

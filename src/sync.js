@@ -863,7 +863,7 @@ function createData(reste, state) {
 			perPage: meta.config.perPage,
 			limit: meta.config.limit,
 			content: meta.config.content,
-			held: () => collection.models
+			held: () => collection.models.filter(model => !model._pendingCreate) // a cursor is a row the server has seen
 		}, null, null);
 		return meta.pager;
 	}
@@ -989,6 +989,12 @@ function createData(reste, state) {
 		};
 		// The collection changed while the request was in flight: the body is needed after all.
 		const ready = response => (response.unchanged && !isClean(response.url) ? response.materialize() : response);
+		// What the collection held when a refresh was sent. The refresh speaks for those rows; one that got
+		// here later (a socket event, another response) is not in a list the server made before it.
+		let known = null;
+		const sent = () => {
+			known = replace ? new Set(collection.models) : null;
+		};
 
 		const apply = (page) => {
 			if (generation !== state.generation) {
@@ -1018,7 +1024,12 @@ function createData(reste, state) {
 				const oldestFirst = pagination.order !== 'desc';
 				position = (direction === 'next') === oldestFirst ? 'start' : 'end';
 			}
-			return merger.upsert(collection, page.items, mergeSettings(meta, settings, replace ? 'replace' : 'merge', position));
+			const merging = mergeSettings(meta, settings, replace ? 'replace' : 'merge', position);
+			if (known) {
+				const held = known;
+				merging.arrived = model => !held.has(model);
+			}
+			return merger.upsert(collection, page.items, merging);
 		};
 		const settled = (page) => {
 			if (page.unchanged) {
@@ -1026,7 +1037,9 @@ function createData(reste, state) {
 			}
 			publish(meta, collection, page);
 			if (replace && page.response) {
-				meta.cleanAt = meta.mutations;
+				// A row the refresh kept without the server having listed it: the next refresh has to look
+				// at the collection again, also when the server sends the same bytes.
+				meta.cleanAt = page.models && page.models.length !== collection.length ? -1 : meta.mutations;
 				meta.lastUrl = page.response.url;
 			} else if (page.response) {
 				meta.mutations++; // more than the first page is held now
@@ -1035,6 +1048,7 @@ function createData(reste, state) {
 		};
 
 		if (!pagination) {
+			sent();
 			const handle = state.call(config.read, listParams(meta, settings, null), requestOptions());
 			collection.trigger('request', collection, handle, settings);
 			return finished(handle.then((response) => {
@@ -1049,6 +1063,7 @@ function createData(reste, state) {
 		let requestHandle = null;
 		const hooks = {
 			call(query) {
+				sent();
 				requestHandle = state.call(config.read, listParams(meta, settings, query), requestOptions());
 				collection.trigger('request', collection, requestHandle, settings);
 				const prepared = requestHandle.then(ready);

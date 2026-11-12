@@ -90,11 +90,25 @@ const MUTATIONS = [
 	['merge: the identity map is not consulted', 'src/merge.js', 'return collection.get(id) || pending.get(id) || (identity ? identity.get(id) : undefined);', 'return collection.get(id) || pending.get(id);'],
 	['merge: a refresh re-adds a model that is being destroyed', 'src/merge.js', 'if (destroying && destroying.has(attrs[idAttribute])) {\n\t\t\t\t\t\t\tcontinue;', 'if (false) {\n\t\t\t\t\t\t\tcontinue;'],
 	['merge: a refresh reverts an optimistic change', 'src/attributes.js', 'if (pending && pending[key] > 0) {\n\t\t\tcontinue;', 'if (false) {\n\t\t\tcontinue;'],
-	['merge: a refresh drops a model that is being created', 'src/merge.js', 'if (model._pendingCreate && !wanted.has(model)) {', 'if (false) {'],
+	['merge: a refresh drops a model that is being created', 'src/merge.js', 'if ((model._pendingCreate || arrived(model)) && !wanted.has(model)) {', 'if (arrived(model) && !wanted.has(model)) {'],
 	['optimistic: rollback restores everything', 'src/sync.js', 'if (deepEqual(model.get(name), attrs[name])) {\n\t\t\t\t\tif (previous[name] === undefined) {', 'if (true) {\n\t\t\t\t\tif (previous[name] === undefined) {'],
 	['identity: the map never drops a model', 'src/identity.js', '} else if (map.size > limit) {\n\t\t\t\ttrim();', '} else if (false) {\n\t\t\t\ttrim();'],
 	['pager: duplicate rows kept', 'src/pagination.js', 'if (seen.has(id)) {\n\t\t\t\treturn false;', 'if (false) {\n\t\t\t\treturn false;'],
-	['list: the filter is ignored when a model joins', 'src/list.js', 'if (loaded && model && filter(model)) {\n\t\t\tinsert(model);', 'if (loaded && model) {\n\t\t\tinsert(model);'],
+	['list: the filter is ignored when a model joins', 'src/list.js', 'if (model && filter(model)) {\n\t\t\tjoin(model);', 'if (model) {\n\t\t\tjoin(model);'],
+	// ---- a page speaks for the list as it was when it was asked for
+	['list: a page drops a row that got here after it was asked for', 'src/list.js', 'Boolean(model._pendingCreate) || since.get(model) > sent;', 'Boolean(model._pendingCreate);'],
+	['list: a page drops a row the device is creating', 'src/list.js', 'Boolean(model._pendingCreate) || since.get(model) > sent;', 'since.get(model) > sent;'],
+	['list: a page counts from when it lands, not from when it was asked for', 'src/list.js', 'page.asked = asked[direction];', 'page.asked = clock;'],
+	['list: the rows a page brought are forgotten by an older refresh', 'src/list.js', 'if (!(since.get(model) > sent)) {\n\t\t\t\tsince.set(model, sent);\n\t\t\t}', ''],
+	['list: a row that arrives during the first load never joins', 'src/list.js', 'early.push(model);', ''],
+	['list: a newer page goes after rows that joined while it was out', 'src/list.js', 'while (edge > 0 && beyond(kept[edge - 1])) {', 'while (false) {'],
+	['list: a newest-first newer page goes above rows that joined while it was out', 'src/list.js', 'while (edge < kept.length && beyond(kept[edge])) {', 'while (false) {'],
+	['list: a page puts back a member an unanswered change took out', 'src/list.js', 'if (!incoming.has(model) && !(changing(model) && !filter(model))) {', 'if (!incoming.has(model)) {'],
+	['list: writes lose their protection before the page is shown', 'src/list.js', 'deps.track(landed);', 'deps.track(Promise.resolve());'],
+	['list: a cursor is taken from a row being created', 'src/list.js', 'held: () => members.filter(model => !model._pendingCreate)', 'held: () => members'],
+	['collection: a cursor is taken from a row being created', 'src/sync.js', 'held: () => collection.models.filter(model => !model._pendingCreate)', 'held: () => collection.models'],
+	['merge: a refresh drops a model that arrived after it was sent', 'src/merge.js', 'if ((model._pendingCreate || arrived(model)) && !wanted.has(model)) {', 'if (model._pendingCreate && !wanted.has(model)) {'],
+	['collection: a refresh that kept a row counts as clean', 'src/sync.js', 'meta.cleanAt = page.models && page.models.length !== collection.length ? -1 : meta.mutations;', 'meta.cleanAt = meta.mutations;'],
 	['function URLs: compiled variants are never dropped', 'src/index.js', 'if (cache.size >= MAX_VARIANTS) {', 'if (false) {']
 ];
 

@@ -776,7 +776,9 @@ A merge keeps what is there: an item whose id is known updates that model
 is added, and on a refresh models the server no longer sends are removed and
 the order follows the server's (or the collection's comparator). Nothing is
 rebuilt, so references to models stay valid and a bound list is not rendered
-when nothing changed.
+when nothing changed. A refresh removes only what it can speak for: a model
+that reached the collection after the refresh was sent (an `upsert()` from a
+socket, say) keeps its place until the next refresh.
 
 During a merge the collection holds back per-model events and announces the
 result once: `update` (with `changes: { added, removed, merged }`) and
@@ -917,6 +919,25 @@ joined on its own, it moves to where the server has it. What a page returns is
 taken as the server gave it; `filter` only decides about joining and dropping
 out. Cursor lists add `loadOlder()` and `loadNewer()`. `schedule` lets the app
 decide when a change is delivered (after a transition, say).
+
+A page speaks for the list as it was when the page was asked for, not as it
+is when the page lands:
+
+- `refresh()` settles the rows that had joined before it was sent: they stay
+  only if the page has them. A row that got into the list while the request
+  was out (a record created while a refresh is in flight, a socket event, a
+  page that was asked for later and answered first) stays, at `place`, until
+  a page asked for after it got there has it or does not. Calling `refresh()`
+  again while one is out is that same request.
+- A row that reaches the collection while the first page is out joins when
+  that page lands, unless the page brings it.
+- A newer page (`loadNewer()`) goes in before the rows that joined at that end
+  while it was out.
+- A row the device is still creating (`collection.optimistic()`, an optimistic
+  `create()`) is not a page's to drop, whenever the page was asked for, and
+  its temporary id is never sent as a cursor.
+- A member that left the list through an optimistic change the server has not
+  answered yet is not put back by a page that still lists it.
 
 Pages can also come from a function of your own, for an app whose screens go
 through a service layer instead of calling methods:
@@ -1198,15 +1219,16 @@ The example app prints the same measurements on a device (`RESTE-BENCH` lines).
 Verified by running, not only by unit tests:
 
 - **Node**: `npm test` runs the suite against the sources, the built
-  `reste.js` and the two-file build: 841 tests each time. Many of them are the same test
+  `reste.js` and the two-file build: 901 tests each time. Many of them are the same test
   repeated on each Backbone version Alloy ships (0.9.2, 1.1.2, 1.3.3, 1.4.0,
-  1.6.0); there are 403 distinct tests. They cover the request pipeline on a
+  1.6.0); there are 415 distinct tests. They cover the request pipeline on a
   scripted HTTP client, models and collections, an integration suite over real
   sockets against `test/server/server.js`, and 62 scenarios from upstream's
   README run against upstream and this build side by side.
-- **Mutation check**: `npm run mutate` breaks 61 safety-relevant lines one at
+- **Mutation check**: `npm run mutate` breaks 74 safety-relevant lines one at
   a time (what may be retried, what a session reset drops, what the log
-  prints, what the cache keeps); every one makes a test fail.
+  prints, what the cache keeps, what a page may drop from a list); every one
+  makes a test fail.
 - **Android**: Titanium SDK 13.4.1.GA, Alloy 3.0.1, Android 15 (API 35, x86_64
   container): the example app's 48 on-device checks pass.
 - **iOS**: Titanium SDK 13.4.1.GA, Alloy 3.0.1, iOS 27.0 simulator (iPhone 18

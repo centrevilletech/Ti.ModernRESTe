@@ -144,9 +144,9 @@ function readPage(config, response, request, fallbackItems) {
  *
  * Cursor style adds pager.previous() (what is newer than the newest item held).
  *
- * `call(query)` performs the request and returns a handle resolving with the full response; `apply(page,
- * direction)`, when given, puts the page's items somewhere (a collection) and may return a promise. Both can
- * also be given per load: pager.next({ call, apply }).
+ * `call(query, direction)` performs the request and returns a handle resolving with the full response;
+ * `apply(page, direction)`, when given, puts the page's items somewhere (a collection) and may return a
+ * promise. Both can also be given per load: pager.next({ call, apply }).
  */
 function createPager(config, options, defaultCall, defaultApply) {
 	const settings = options || {};
@@ -286,7 +286,7 @@ function createPager(config, options, defaultCall, defaultApply) {
 		const built = queryFor(direction);
 		let handle;
 		try {
-			handle = call(built.query);
+			handle = call(built.query, direction);
 		} catch (error) {
 			return Promise.reject(error);
 		}

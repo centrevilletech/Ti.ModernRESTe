@@ -40,7 +40,8 @@ function touch(dirty, collection) {
 function createMerger(batch) {
 	/**
 	 * settings: Model, idAttribute, mirrorId, identity (Map or null), mode ('merge' | 'replace'),
-	 *           position ('end' | 'start'), chunk, events ('coalesce' | 'each'), changeEvent, isStale()
+	 *           position ('end' | 'start'), chunk, events ('coalesce' | 'each'), changeEvent, isStale(),
+	 *           arrived(model) (replace: true for a model that got here after the list was asked for)
 	 * @returns {{models: Array, added: Array, changed: Array, removed: Array}|Promise}
 	 */
 	function upsert(collection, items, settings) {
@@ -170,9 +171,10 @@ function createMerger(batch) {
 			job.models = desired.slice();
 			const current = collection.models;
 			// A model that was created on the device and is still being sent is not in the server's list
-			// yet: it keeps its place.
+			// yet, and neither is one that got here after the list was asked for: it keeps its place.
+			const arrived = settings.arrived || (() => false);
 			current.forEach((model, index) => {
-				if (model._pendingCreate && !wanted.has(model)) {
+				if ((model._pendingCreate || arrived(model)) && !wanted.has(model)) {
 					wanted.add(model);
 					desired.splice(Math.min(index, desired.length), 0, model);
 				}

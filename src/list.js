@@ -28,6 +28,12 @@ const { isFunction } = require('./util');
  * list when it passes `filter`, at `place` ('start' or 'end'); one that stops passing it, or leaves the
  * collection, drops out. When a later page brings a model that had joined, it takes its place in the page.
  *
+ * A page speaks for the list as it was when the page was asked for. A row that got into the list after
+ * that (it joined, or a page asked for later brought it) is not the page's to drop: it stays at `place`
+ * until a page asked for after it got here has it or does not. The same holds for a row the device is
+ * still creating, and a member the device changed so that it left the list is not put back by a page
+ * while that change is unanswered.
+ *
  * Cursor pagination adds loadOlder() (= loadMore) and loadNewer().
  *
  * deps: { Events, collection, pagination, content, request(params, query, signal) -> handle,
@@ -49,6 +55,9 @@ function createLiveList(deps, options) {
 	let members = [];
 	let memberSet = new Set();
 	let joined = new Set(); // members that came from the collection, not from a page
+	const since = new WeakMap(); // model -> `clock` when it got into the list (a page's rows: when it was asked for)
+	let clock = 0; // moves with every request sent and every row that joins
+	let early = []; // rows that reached the collection while the first page was out: they join when it lands
 	let state = 'idle';
 	let error = null;
 	let loaded = false;
@@ -58,13 +67,19 @@ function createLiveList(deps, options) {
 	let generation = 0;
 	let single = null; // the request in flight of a list without pagination
 
+	const asked = {}; // direction -> `clock` when the request that is out was sent
 	const pager = pagination ? createPager(pagination, {
 		perPage: options.perPage,
 		limit: options.limit,
 		content: deps.content,
-		held: () => members
-	}, pageQuery => deps.request(params, Object.assign({}, query, pageQuery), controller.signal),
-	page => (page.unchanged ? null : mergePage(page.items))) : null;
+		held: () => members.filter(model => !model._pendingCreate) // a cursor is a row the server has seen
+	}, (pageQuery, direction) => {
+		asked[direction] = ++clock;
+		return deps.request(params, Object.assign({}, query, pageQuery), controller.signal);
+	}, (page, direction) => {
+		page.asked = asked[direction];
+		return page.unchanged ? null : mergePage(page.items);
+	}) : null;
 
 	// While one of this list's own pages is being merged into the collection, what the collection announces
 	// is held: the page decides where its models go, and only what came from elsewhere joins on its own.
@@ -137,26 +152,60 @@ function createLiveList(deps, options) {
 		list.trigger('state', state, list);
 	}
 
-	function show(models, how) {
+	/** A change of the device's that the server has not answered yet (model.optimistic(), an optimistic save). */
+	function changing(model) {
+		const pending = model._pendingAttrs;
+		return Boolean(pending) && Object.keys(pending).length > 0;
+	}
+
+	/**
+	 * Puts a page into the list. `sent` is the clock when the page was asked for: the page speaks for the
+	 * list as it was then.
+	 */
+	function show(models, how, sent) {
 		const unique = [];
 		const incoming = new Set();
 		models.forEach((model) => {
-			if (!incoming.has(model)) {
+			// A member the device changed so that it left the list: the page was made before that change.
+			if (!incoming.has(model) && !(changing(model) && !filter(model))) {
 				incoming.add(model);
 				unique.push(model);
 			}
 		});
+		// Not this page's to place or to drop: a row the device is still creating, and one that got here
+		// after the page was asked for.
+		const beyond = model => Boolean(model._pendingCreate) || since.get(model) > sent;
 		if (how === 'replace') {
-			joined = new Set();
-			setMembers(unique);
+			const waiting = early.filter(model => !memberSet.has(model) && filter(model) && inCollection(model));
+			const stay = members.concat(waiting).filter(model => !incoming.has(model) && beyond(model));
+			joined = new Set(stay);
+			early = [];
+			setMembers(place === 'start' ? stay.concat(unique) : unique.concat(stay));
 		} else {
 			// A page brings a model that had joined on its own: it takes its place in the page.
 			const kept = members.filter(model => !(joined.has(model) && incoming.has(model)));
 			unique.forEach(model => joined.delete(model));
 			const have = new Set(kept);
 			const fresh = unique.filter(model => !have.has(model));
-			setMembers(how === 'start' ? fresh.concat(kept) : kept.concat(fresh));
+			// The page goes next to what the list held when it was asked for: rows that got to that end
+			// since then stay beyond it.
+			let edge = how === 'start' ? 0 : kept.length;
+			if (how === 'start') {
+				while (edge < kept.length && beyond(kept[edge])) {
+					edge++;
+				}
+			} else {
+				while (edge > 0 && beyond(kept[edge - 1])) {
+					edge--;
+				}
+			}
+			setMembers(kept.slice(0, edge).concat(fresh, kept.slice(edge)));
 		}
+		unique.forEach((model) => {
+			if (!(since.get(model) > sent)) {
+				since.set(model, sent);
+			}
+		});
 		loaded = true;
 		changed();
 	}
@@ -170,7 +219,18 @@ function createLiveList(deps, options) {
 		next.splice(Math.max(0, Math.min(at, next.length)), 0, model);
 		setMembers(next);
 		joined.add(model);
+		since.set(model, ++clock);
 		changed();
+	}
+
+	/** A model the collection got on its own: into the list, or kept for the first page that is on its way. */
+	function join(model) {
+		if (loaded) {
+			insert(model);
+		} else if (state === 'loading' && early.indexOf(model) === -1) {
+			early.push(model);
+			since.set(model, ++clock);
+		}
 	}
 
 	function remove(target) {
@@ -188,8 +248,8 @@ function createLiveList(deps, options) {
 			held.push({ model, handle: onAdd });
 			return;
 		}
-		if (loaded && model && filter(model)) {
-			insert(model);
+		if (model && filter(model)) {
+			join(model);
 		}
 	}
 
@@ -204,8 +264,8 @@ function createLiveList(deps, options) {
 		const member = memberSet.has(model);
 		if (member && !filter(model)) {
 			remove(model);
-		} else if (!member && loaded && filter(model) && inCollection(model)) {
-			insert(model);
+		} else if (!member && filter(model) && inCollection(model)) {
+			join(model);
 		} else if (member) {
 			changed(); // a member's attributes: the screen updates that row
 		}
@@ -236,15 +296,12 @@ function createLiveList(deps, options) {
 	function settle(promise, how, more) {
 		const mine = generation;
 		failedMore = false;
-		if (deps.track) {
-			deps.track(promise); // optimistic writes stay protected until this load has landed
-		}
-		return promise.then((page) => {
+		const landed = promise.then((page) => {
 			if (destroyed || mine !== generation || page.discarded) {
 				return page;
 			}
 			if (page.response && !page.unchanged) {
-				show(page.models || [], how);
+				show(page.models || [], how, page.asked);
 				list.meta = page.meta;
 			} else if (!loaded) {
 				loaded = true;
@@ -261,16 +318,24 @@ function createLiveList(deps, options) {
 			list.trigger('error', failure, list);
 			return null;
 		});
+		if (deps.track) {
+			// Optimistic writes stay protected until this load has landed: in the collection, and here, so
+			// the page above still sees which rows the device is creating.
+			deps.track(landed);
+		}
+		return landed;
 	}
 
 	function loadSingle() {
 		if (single) {
 			single.abort();
 		}
+		const sent = ++clock;
 		const handle = single = deps.request(params, Object.assign({}, query), controller.signal);
 		return handle.then((response) => {
 			const page = readPage({ style: 'page', items: null, meta: null }, response, null, deps.content);
 			page.response = response;
+			page.asked = sent;
 			return mergePage(page.items).then(result => Object.assign(page, result));
 		});
 	}
@@ -367,6 +432,7 @@ function createLiveList(deps, options) {
 			}
 			setMembers([]);
 			joined = new Set();
+			early = [];
 			loaded = false;
 			return list.load();
 		},

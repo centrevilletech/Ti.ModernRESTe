@@ -47,6 +47,29 @@
 
 ### Fixed
 
+- A page took rows out of a list, or put them in the wrong place, that it
+  could not know about: it now speaks for the list as it was when the page was
+  asked for
+  - `list.refresh()` dropped a row that had joined while the request was out
+    (a record created while a refresh is in flight, a socket event). It stays,
+    at `place`, until a page asked for after it joined has it or does not. A
+    second `refresh()` that joins the request already out counts from when
+    that request was sent, and a refresh answered after a newer page no longer
+    drops what that page brought
+  - a row that reached the collection while the first page was out never
+    joined: it joins when that page lands
+  - `loadNewer()` put its page after rows that had joined at that end while it
+    was out
+  - a refresh dropped a row the device was still creating
+    (`collection.optimistic()`, an optimistic `create()`) from the list,
+    although the collection kept it
+  - a page put a member back that an unanswered optimistic change had taken
+    out of the list
+  - the temporary id of a row being created was sent as the cursor of
+    `loadNewer()`, `loadOlder()`, `fetchPrevious()` and `fetchNext()`
+  - `collection.refresh()` removed a model that had reached the collection
+    after the refresh was sent
+
 - A request a status hook had sent again stayed exempt from the next session
   reset: it is in flight again and dropped with the session like any other
 
