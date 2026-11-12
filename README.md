@@ -938,6 +938,9 @@ is when the page lands:
   its temporary id is never sent as a cursor.
 - A member that left the list through an optimistic change the server has not
   answered yet is not put back by a page that still lists it.
+- A page that a `reload()` or a later `refresh()` overtook answers for
+  nothing. When a `load` function had merged its rows itself, they do not
+  stay in the list.
 
 Pages can also come from a function of your own, for an app whose screens go
 through a service layer instead of calling methods:
@@ -1219,13 +1222,13 @@ The example app prints the same measurements on a device (`RESTE-BENCH` lines).
 Verified by running, not only by unit tests:
 
 - **Node**: `npm test` runs the suite against the sources, the built
-  `reste.js` and the two-file build: 901 tests each time. Many of them are the same test
+  `reste.js` and the two-file build: 911 tests each time. Many of them are the same test
   repeated on each Backbone version Alloy ships (0.9.2, 1.1.2, 1.3.3, 1.4.0,
-  1.6.0); there are 415 distinct tests. They cover the request pipeline on a
+  1.6.0); there are 417 distinct tests. They cover the request pipeline on a
   scripted HTTP client, models and collections, an integration suite over real
   sockets against `test/server/server.js`, and 62 scenarios from upstream's
   README run against upstream and this build side by side.
-- **Mutation check**: `npm run mutate` breaks 74 safety-relevant lines one at
+- **Mutation check**: `npm run mutate` breaks 77 safety-relevant lines one at
   a time (what may be retried, what a session reset drops, what the log
   prints, what the cache keeps, what a page may drop from a list); every one
   makes a test fail.

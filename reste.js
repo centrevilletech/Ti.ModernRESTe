@@ -3042,19 +3042,14 @@
 			let generation = 0;
 			let single = null; // the request in flight of a list without pagination
 
-			const asked = {}; // direction -> `clock` when the request that is out was sent
 			const pager = pagination ? createPager(pagination, {
 				perPage: options.perPage,
 				limit: options.limit,
 				content: deps.content,
-				held: () => members.filter(model => !model._pendingCreate) // a cursor is a row the server has seen
-			}, (pageQuery, direction) => {
-				asked[direction] = ++clock;
-				return deps.request(params, Object.assign({}, query, pageQuery), controller.signal);
-			}, (page, direction) => {
-				page.asked = asked[direction];
-				return page.unchanged ? null : mergePage(page.items);
-			}) : null;
+				held: () => members.filter(model => !model._pendingCreate), // a cursor is a row the server has seen
+				stamp: () => ++clock // page.sent: when its request went out
+			}, pageQuery => deps.request(params, Object.assign({}, query, pageQuery), controller.signal),
+			page => (page.unchanged ? null : mergePage(page.items))) : null;
 
 			// While one of this list's own pages is being merged into the collection, what the collection announces
 			// is held: the page decides where its models go, and only what came from elsewhere joins on its own.
@@ -3151,7 +3146,8 @@
 				// after the page was asked for.
 				const beyond = model => Boolean(model._pendingCreate) || since.get(model) > sent;
 				if (how === 'replace') {
-					const waiting = early.filter(model => !memberSet.has(model) && filter(model) && inCollection(model));
+					const waiting = (place === 'start' ? early.slice().reverse() : early)
+						.filter(model => !memberSet.has(model) && filter(model) && inCollection(model));
 					const stay = members.concat(waiting).filter(model => !incoming.has(model) && beyond(model));
 					joined = new Set(stay);
 					early = [];
@@ -3196,6 +3192,21 @@
 				joined.add(model);
 				since.set(model, ++clock);
 				changed();
+			}
+
+			/**
+			 * A page nobody waits for any more: a reload or a refresh overtook it. When the app's own `load` had
+			 * merged its rows, they reached the collection like any other row and joined; they go again.
+			 */
+			function abandon(page) {
+				(page.items || []).forEach((model) => {
+					if (model && model.cid !== undefined && since.get(model) > page.sent) {
+						early = early.filter(other => other !== model);
+						if (joined.has(model)) {
+							remove(model);
+						}
+					}
+				});
 			}
 
 			/** A model the collection got on its own: into the list, or kept for the first page that is on its way. */
@@ -3272,11 +3283,15 @@
 				const mine = generation;
 				failedMore = false;
 				const landed = promise.then((page) => {
-					if (destroyed || mine !== generation || page.discarded) {
+					if (destroyed) {
+						return page;
+					}
+					if (mine !== generation || page.discarded) {
+						abandon(page);
 						return page;
 					}
 					if (page.response && !page.unchanged) {
-						show(page.models || [], how, page.asked);
+						show(page.models || [], how, page.sent);
 						list.meta = page.meta;
 					} else if (!loaded) {
 						loaded = true;
@@ -3302,7 +3317,7 @@
 			}
 
 			function loadSingle() {
-				if (single) {
+				if (single && isFunction(single.abort)) {
 					single.abort();
 				}
 				const sent = ++clock;
@@ -3310,8 +3325,9 @@
 				return handle.then((response) => {
 					const page = readPage({ style: 'page', items: null, meta: null }, response, null, deps.content);
 					page.response = response;
-					page.asked = sent;
-					return mergePage(page.items).then(result => Object.assign(page, result));
+					page.sent = sent;
+					// (A request that could not be aborted and was overtaken by the next one answers for nothing.)
+					return mergePage(page.items).then(result => Object.assign(page, result, { discarded: single !== handle }));
 				});
 			}
 
@@ -4070,9 +4086,10 @@
 		 *
 		 * Cursor style adds pager.previous() (what is newer than the newest item held).
 		 *
-		 * `call(query, direction)` performs the request and returns a handle resolving with the full response;
-		 * `apply(page, direction)`, when given, puts the page's items somewhere (a collection) and may return a
-		 * promise. Both can also be given per load: pager.next({ call, apply }).
+		 * `call(query)` performs the request and returns a handle resolving with the full response; `apply(page,
+		 * direction)`, when given, puts the page's items somewhere (a collection) and may return a promise. Both can
+		 * also be given per load: pager.next({ call, apply }). `options.stamp()`, when given, is called as a request
+		 * is sent, and what it returns is that request's page.sent.
 		 */
 		function createPager(config, options, defaultCall, defaultApply) {
 			const settings = options || {};
@@ -4210,9 +4227,10 @@
 				}
 				const mine = generation;
 				const built = queryFor(direction);
+				const sent = isFunction(settings.stamp) ? settings.stamp() : undefined;
 				let handle;
 				try {
-					handle = call(built.query, direction);
+					handle = call(built.query);
 				} catch (error) {
 					return Promise.reject(error);
 				}
@@ -4231,6 +4249,7 @@
 						: readPage(config, response, built.request, settings.content);
 					page.response = response;
 					page.direction = direction;
+					page.sent = sent;
 					return Promise.resolve(apply ? apply(page, direction) : null).then((applied) => {
 						if (page.unchanged) {
 							settle();

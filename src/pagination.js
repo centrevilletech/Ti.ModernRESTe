@@ -144,9 +144,10 @@ function readPage(config, response, request, fallbackItems) {
  *
  * Cursor style adds pager.previous() (what is newer than the newest item held).
  *
- * `call(query, direction)` performs the request and returns a handle resolving with the full response;
- * `apply(page, direction)`, when given, puts the page's items somewhere (a collection) and may return a
- * promise. Both can also be given per load: pager.next({ call, apply }).
+ * `call(query)` performs the request and returns a handle resolving with the full response; `apply(page,
+ * direction)`, when given, puts the page's items somewhere (a collection) and may return a promise. Both can
+ * also be given per load: pager.next({ call, apply }). `options.stamp()`, when given, is called as a request
+ * is sent, and what it returns is that request's page.sent.
  */
 function createPager(config, options, defaultCall, defaultApply) {
 	const settings = options || {};
@@ -284,9 +285,10 @@ function createPager(config, options, defaultCall, defaultApply) {
 		}
 		const mine = generation;
 		const built = queryFor(direction);
+		const sent = isFunction(settings.stamp) ? settings.stamp() : undefined;
 		let handle;
 		try {
-			handle = call(built.query, direction);
+			handle = call(built.query);
 		} catch (error) {
 			return Promise.reject(error);
 		}
@@ -305,6 +307,7 @@ function createPager(config, options, defaultCall, defaultApply) {
 				: readPage(config, response, built.request, settings.content);
 			page.response = response;
 			page.direction = direction;
+			page.sent = sent;
 			return Promise.resolve(apply ? apply(page, direction) : null).then((applied) => {
 				if (page.unchanged) {
 					settle();

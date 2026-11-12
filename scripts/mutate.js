@@ -98,7 +98,10 @@ const MUTATIONS = [
 	// ---- a page speaks for the list as it was when it was asked for
 	['list: a page drops a row that got here after it was asked for', 'src/list.js', 'Boolean(model._pendingCreate) || since.get(model) > sent;', 'Boolean(model._pendingCreate);'],
 	['list: a page drops a row the device is creating', 'src/list.js', 'Boolean(model._pendingCreate) || since.get(model) > sent;', 'since.get(model) > sent;'],
-	['list: a page counts from when it lands, not from when it was asked for', 'src/list.js', 'page.asked = asked[direction];', 'page.asked = clock;'],
+	['list: a page counts from when it lands, not from when it was asked for', 'src/list.js', 'show(page.models || [], how, page.sent);', 'show(page.models || [], how, clock);'],
+	['list: an overtaken page leaves the rows its loader merged', 'src/list.js', 'abandon(page);\n\t\t\t\treturn page;', 'return page;'],
+	['list: an overtaken page takes rows that had joined before it was asked for', 'src/list.js', 'if (model && model.cid !== undefined && since.get(model) > page.sent) {', 'if (model && model.cid !== undefined) {'],
+	['list: an unpaginated refresh that was overtaken answers for the list', 'src/list.js', '{ discarded: single !== handle }', '{ discarded: false }'],
 	['list: the rows a page brought are forgotten by an older refresh', 'src/list.js', 'if (!(since.get(model) > sent)) {\n\t\t\t\tsince.set(model, sent);\n\t\t\t}', ''],
 	['list: a row that arrives during the first load never joins', 'src/list.js', 'early.push(model);', ''],
 	['list: a newer page goes after rows that joined while it was out', 'src/list.js', 'while (edge > 0 && beyond(kept[edge - 1])) {', 'while (false) {'],

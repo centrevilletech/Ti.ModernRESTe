@@ -552,6 +552,69 @@ eachBackbone((Backbone, version) => {
 			assert.deepEqual(ids(list), [1, 4, 5, 7]);
 		});
 
+		it('a page that a reload or a refresh overtook brings nothing into the list, also when `load` merged its rows itself', async () => {
+			// The app's loader merges every answer into the collection, whether or not the list still waits for it.
+			const asked = [];
+			const list = api.list({
+				collection: 'jobs', paginate: { style: 'page', perPage: 2 },
+				load: query => new Promise((resolve) => {
+					asked.push({ query, answer: (rows, last) => resolve({ items: jobs.upsert(rows).models, meta: { current_page: query.page, last_page: last || 1 } }) });
+				})
+			});
+			const first = list.load();
+			const second = list.reload({ query: { q: 'other' } }); // other filters while the first page is out
+			asked[0].answer([{ id: 71 }]); // the overtaken page arrives first ...
+			asked[1].answer([{ id: 72 }]);
+			await Promise.all([first, second]);
+			assert.deepEqual(ids(list), [72]);
+			const third = list.reload({ query: { q: 'again' } });
+			const fourth = list.reload({ query: { q: 'and again' } });
+			asked[3].answer([{ id: 74 }], 2);
+			await fourth;
+			asked[2].answer([{ id: 73 }]); // ... or last
+			await third;
+			assert.deepEqual(ids(list), [74]);
+			// A next page overtaken by a refresh, landing before the refreshed page and after it.
+			const more = list.loadMore();
+			const refreshing = list.refresh();
+			asked[4].answer([{ id: 75 }], 2);
+			asked[5].answer([{ id: 74 }], 2);
+			await Promise.all([more, refreshing]);
+			assert.deepEqual(ids(list), [74]);
+			const again = list.loadMore();
+			const refreshed = list.refresh();
+			asked[7].answer([{ id: 74 }], 2);
+			await refreshed;
+			asked[6].answer([{ id: 76 }], 2);
+			await again;
+			assert.deepEqual(ids(list), [74]);
+			// What the overtaken page shares with rows that joined on their own before it was asked for stays.
+			jobs.upsert({ id: 77 });
+			const late = list.loadMore();
+			const final = list.refresh();
+			asked[8].answer([{ id: 77 }, { id: 78 }], 2);
+			await late;
+			assert.deepEqual(ids(list), [77, 74]);
+			asked[9].answer([{ id: 74 }, { id: 77 }], 2);
+			await final;
+			assert.deepEqual(ids(list), [74, 77]);
+		});
+
+		it('without pagination and with `load`: a refresh overtaken by the next one does not answer for it', async () => {
+			const own = new Backbone.Collection();
+			const asked = [];
+			const list = api.list({ collection: own, paginate: false, load: () => new Promise(resolve => asked.push(resolve)) });
+			const first = list.load();
+			const second = list.refresh(); // `load` cannot be aborted: both are out
+			asked[1]([{ id: 2 }]);
+			await second;
+			assert.deepEqual(ids(list), [2]);
+			asked[0]([{ id: 1 }]); // made before the one that is shown
+			await first;
+			assert.deepEqual(ids(list), [2]);
+			assert.equal(list.state, 'idle');
+		});
+
 		it('works without pagination', async () => {
 			const list = api.list({ collection: 'plain' });
 			await list.load();

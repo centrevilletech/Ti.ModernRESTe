@@ -69,6 +69,10 @@
     `loadNewer()`, `loadOlder()`, `fetchPrevious()` and `fetchNext()`
   - `collection.refresh()` removed a model that had reached the collection
     after the refresh was sent
+  - a page that a `reload()` or a later `refresh()` had overtaken left its
+    rows in the list when the `load` function had merged them itself
+  - an unpaginated list with `load` threw on a `refresh()` while another was
+    out, and would have shown the older answer when it arrived last
 
 - A request a status hook had sent again stayed exempt from the next session
   reset: it is in flight again and dropped with the session like any other
