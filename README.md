@@ -5,9 +5,12 @@ your endpoints once, get a method per endpoint, and bind lists to collections
 that load themselves.
 
 This is a maintained fork of [RESTe](https://github.com/jasonkneen/RESTe) by
-Jason Kneen. It is still one file with no dependencies, `require('reste')`
-still returns the same constructor, and a 1.x config still works. What is new
-is everything an app ends up writing around RESTe: promises, per-request
+[Jason Kneen](https://github.com/jasonkneen). Jason's idea, a whole API
+described in one config and turned into methods, models and collections, is
+why so many Titanium apps were quick to build, and this fork keeps it the way
+he designed it: still one file with no dependencies, `require('reste')` still
+returns the same constructor, and a 1.x config still works. What is new is the
+code an app ends up writing around RESTe as it grows: promises, per-request
 headers, typed errors, retries, idempotency keys, caching, pagination, uploads
 with progress, cancellation, and collections that update in place instead of
 being rebuilt.
@@ -33,38 +36,39 @@ api.getArticle({ id: 42 }, article => show(article), error => warn(error)); // .
 
 ## Why this fork exists
 
-RESTe's last npm release is 1.6.0 from 2021. It still works for simple calls,
-but anything beyond them has to be built around it, and some of what it does
-is wrong in ways that only show up in production:
+RESTe has carried Titanium apps for more than ten years, and its last npm
+release, 1.6.0 from 2021, still does what it was written to do. Apps and APIs
+have asked for more since then, and every project we built on RESTe grew the
+same layer around it. This fork moves that layer into the library, and along
+the way settles a handful of things that only show up once an app is busy:
 
-- **Promises never worked after 1.5.x.** `config.Q` creates a deferred, but
-  every code path returns the HTTP client before the line that returns the
-  promise. The usual workaround is to wrap every call by hand.
-- **It replaces `Backbone.sync` for the whole app.** A second RESTe instance
-  breaks the first one's models, and any other Backbone model in the app goes
-  through RESTe.
-- **Headers are one shared list**, sent to every URL including third-party
-  ones. Per-request headers mean changing the defaults right before a call and
-  relying on them being read synchronously.
-- **The response is parsed twice** (once to test whether it is JSON, once for
-  the value), and every list fetch rebuilds the collection: with Backbone 1.x
-  an Alloy `dataCollection` view is rendered once per row.
-- **A path value is put into the URL as it is**, a missing one is sent as a
-  literal `<id>`, and a value that contains its own placeholder never returns.
-- **Model sync has copy-paste bugs**: `beforeCreate` runs on delete and
-  `beforeDelete` on create, a response with a `code` field above 200 is an
-  error, `item.id` is overwritten with `undefined` when no id is configured.
-- No status code on errors by default, no query strings, no multipart, no
-  cancellation of a retried request, no paging metadata, no cache.
+- **Promises.** Since 1.5.x a call made with `config.Q` returned the HTTP
+  client rather than its promise, so apps wrapped each call by hand. 2.0
+  returns a promise from every call.
+- **Model sync** was installed on `Backbone.sync` for the whole app. 2.0
+  scopes it to the instance, so two RESTe instances, or RESTe and an app's
+  other Backbone models, live side by side.
+- **Headers** were one shared list for every URL. 2.0 has defaults, per-method
+  and per-call headers, resolved for each request.
+- **Lists** rebuilt their collection on every fetch, which with Backbone 1.x
+  draws an Alloy `dataCollection` view once per row. 2.0 merges in place and
+  parses a response once.
+- **Path values** went into the URL as they were. 2.0 encodes them, and a call
+  with one missing rejects before anything is sent.
+- **Model hooks and ids.** The create and delete hooks run for their own
+  verbs, a `code` field in a response is data, and `item.id` is left alone
+  when no id is configured.
+- **New**: a status code on every error, query strings, multipart,
+  cancellation of a retried request, paging metadata, and a cache.
 
-The full list, with the test that covers each fix, is in
-[docs/upstream-audit.md](https://github.com/centrevilletech/Ti.ModernRESTe/blob/HEAD/docs/upstream-audit.md).
+The notes this work started from, with the test that covers each change, are
+in [docs/upstream-audit.md](https://github.com/centrevilletech/Ti.ModernRESTe/blob/HEAD/docs/upstream-audit.md).
 
 ## What changed
 
 | Area | 1.x | 2.0 |
 | --- | --- | --- |
-| Calls | callbacks; promises broken | a promise from every call, callbacks still supported, `abort()` on the returned handle |
+| Calls | callbacks | a promise from every call, callbacks still supported, `abort()` on the returned handle |
 | Headers | one shared list | defaults + per method + per call, resolved for each request |
 | Parameters | raw substitution, silent on missing ones | encoded, a missing one rejects; query strings from objects (arrays, nested, nulls) |
 | Bodies | JSON or form | JSON, form, multipart with `Ti.Blob` / files, raw strings; upload and download progress |
@@ -1269,9 +1273,10 @@ app and how to run its checks are described in
 ## License and credit
 
 RESTe was created by [Jason Kneen](https://github.com/jasonkneen), with
-contributions from the Titanium community; this repository is a fork of his
-work and keeps its history. The changes in this fork are by Centreville Tech
-LLC and are offered back to the upstream project.
+contributions from the Titanium community. Thank you, Jason: this fork exists
+because RESTe was worth building on. The repository keeps the project's
+history, and the changes in this fork, by Centreville Tech LLC, are offered
+back to the upstream project.
 
 <pre>
 Copyright Jason Kneen

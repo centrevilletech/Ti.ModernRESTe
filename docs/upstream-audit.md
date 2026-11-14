@@ -1,6 +1,12 @@
-# Audit of upstream RESTe
+# Notes on upstream RESTe
 
-What was read before anything was changed: upstream's `reste.js` at its master
+These notes are a reading of upstream RESTe made before this fork changed
+anything. They are a map of the work, not a criticism of the library: RESTe
+has carried production apps for years, and most of what is listed here only
+matters at a size, or under conditions, that it was never asked to handle when
+it was written.
+
+What was read: upstream's `reste.js` at its master
 (`e54b51d`, 592 lines, `package.json` 1.7.0), its history since the last npm
 release (1.6.0, November 2021), its 47 issues and 33 pull requests, and how it
 attaches to Alloy and Backbone.
@@ -51,15 +57,15 @@ Backbone and the HTTP client by injection (`config.Backbone`,
 
 All of that is kept.
 
-## Defects
+## What this fork changed
 
 Each has a test; the file is under `test/unit/` unless stated.
 
 ### Requests
 
-| # | Defect | Fix | Test |
+| # | Upstream | In this fork | Test |
 | --- | --- | --- | --- |
-| 1 | Promises never work: with `config.Q` a deferred is created, but both branches `return makeHttpRequest(...)` before `return deferred.promise` (issue 74, since pull request 73) | every call returns a native promise | `compat`: "gives promises without Q" |
+| 1 | With `config.Q` the promise is not returned: a deferred is created, but both branches `return makeHttpRequest(...)` before `return deferred.promise` (issue 74, since pull request 73) | every call returns a native promise | `compat`: "gives promises without Q" |
 | 2 | The response text is parsed twice: `isJSON()` parses to test, `parseJSON()` parses again | parsed once | `requests`: "parses the response text once" |
 | 3 | `while (url.indexOf('<' + param + '>') >= 0)` never ends when a value contains its own placeholder | templates are split once and joined | `url`: "does not loop when a value contains its own placeholder" |
 | 4 | Path values are inserted unencoded | encoded; `encodeParams: false` opts out | `url`, `requests` |
@@ -89,7 +95,7 @@ Each has a test; the file is under `test/unit/` unless stated.
 
 ### Models and collections
 
-| # | Defect | Fix | Test |
+| # | Upstream | In this fork | Test |
 | --- | --- | --- | --- |
 | 28 | `Backbone.sync` is replaced for the whole app | scoped `sync` per model class and collection | `sync`: "leaves Backbone.sync alone" |
 | 29 | A second instance with models replaces the first one's `Backbone.sync`. A fetch of the first instance's collection then looks its model up in the second instance's config, finds nothing, and does nothing at all: no request, no `success`, no `error`; a model `save` of the first instance throws a `TypeError` (issues 12, 53) | instances are independent | `sync`: "two instances with models do not break each other" |
@@ -125,16 +131,17 @@ the requests sent. `test/unit/differential.test.js` fails when a scenario
 differs without being listed there with its reason, and when a listed one no
 longer differs. That is how the README's migration table is kept complete.
 
-## Limitations that became features
+## Additions
 
-No per-request options; no timeout per call (per method only); no status
-hooks; no retry policy (only the manual `retry()`); no idempotency keys; no
-cache or conditional requests; no pagination; no upload or download progress;
-no interceptors; no way to drop late responses after sign-out; no
-de-duplication; no types; no tests. Each is described in the README.
+Not in upstream, and added here: per-request options; a timeout per call (upstream has one per method); status
+hooks; a retry policy (upstream hands the error handler a manual `retry()`);
+idempotency keys; a cache and conditional requests; pagination; upload and
+download progress; interceptors; a way to drop late responses after sign-out;
+de-duplication; type declarations; a test suite. Each is described in the
+README.
 
 ## Worth offering upstream
 
-Defects 1, 2, 3, 8, 30, 31, 32 and 36 are small, self-contained and
+Items 1, 2, 3, 8, 30, 31, 32 and 36 are small, self-contained and
 uncontroversial; they can be offered to upstream as individual pull requests
 against its single file without any of this fork's structure.
