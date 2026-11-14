@@ -1,94 +1,6 @@
 # Changelog
 
-## Unreleased
-
-### Added
-
-- A two-file build in `split/`: `reste.js` without models, collections,
-  lists and pagination, and `reste.data.js`, read from the same folder when
-  one of them is first used. A cold start that only sends requests loads a
-  little over half of the code
-- `api.preload()` loads that part ahead of time; `api.inspect().loaded.data`
-  says whether an instance has needed it
-
-- A status hook can answer `false`: the response was not its event (one
-  status used for two things), and the firing does not swallow the next
-  response with that status
-- `redact.allow`: names that only look like a credential and may be logged
-
-- `methodOverride` (per instance or per method, off by default): a request
-  the platform cannot send with its body, a `DELETE` on Android, goes out as
-  `POST` with the real method in `X-HTTP-Method-Override` (the header, the
-  methods and "on every platform" are configurable). Retries, hooks, the log
-  and errors still see the method that was asked for
-
-- `api.list({ collection, load })`: a list whose pages come from a function
-  of the app (a service call) instead of a method, over RESTe's collections
-  or any Backbone collection
-- `api.upsert(collection, items)`, `api.replace(model, attributes)` and
-  `api.optimistic(target, attributes, send)`: the collection and model
-  helpers as functions, also for models and collections the app created
-  itself
-
-- A custom `logger` gets the facts of every line about a request as its
-  third argument (`event`, `endpoint`, `method`, `url`, `attempt`, `status`,
-  `kind`, `elapsed`, `duration`, `delay`, `fromCache`): enough to print a line
-  in an app's own format, one per exchange, or to keep request timings
-
-### Changed
-
-- Models, collections, lists and pagination are set up on first use instead
-  of in the constructor, in every build; `api.replace()` on a model the app
-  made itself does not need them
-
-- `mapError` is also asked about cancelled and stale requests, so a call
-  rejects with the app's own error class whatever happened to it. Callbacks,
-  hooks and `config.onError` still never hear of such a request
-
-### Fixed
-
-- A page took rows out of a list, or put them in the wrong place, that it
-  could not know about: it now speaks for the list as it was when the page was
-  asked for
-  - `list.refresh()` dropped a row that had joined while the request was out
-    (a record created while a refresh is in flight, a socket event). It stays,
-    at `place`, until a page asked for after it joined has it or does not. A
-    second `refresh()` that joins the request already out counts from when
-    that request was sent, and a refresh answered after a newer page no longer
-    drops what that page brought
-  - a row that reached the collection while the first page was out never
-    joined: it joins when that page lands
-  - `loadNewer()` put its page after rows that had joined at that end while it
-    was out
-  - a refresh dropped a row the device was still creating
-    (`collection.optimistic()`, an optimistic `create()`) from the list,
-    although the collection kept it
-  - a page put a member back that an unanswered optimistic change had taken
-    out of the list
-  - the temporary id of a row being created was sent as the cursor of
-    `loadNewer()`, `loadOlder()`, `fetchPrevious()` and `fetchNext()`
-  - `collection.refresh()` removed a model that had reached the collection
-    after the refresh was sent
-  - a page that a `reload()` or a later `refresh()` had overtaken left its
-    rows in the list when the `load` function had merged them itself
-  - an unpaginated list with `load` threw on a `refresh()` while another was
-    out, and would have shown the older answer when it arrived last
-
-- A request a status hook had sent again stayed exempt from the next session
-  reset: it is in flight again and dropped with the session like any other
-
-- A response with no freshness left and no validator (`ttl: 0`, or the
-  `'etag'` policy, answered without an `ETag`) was kept, and persisted,
-  although it could never be served again
-
-- Rolling back an optimistic change removed an attribute whose value had been
-  `null` (Backbone's `has()` is false for it) instead of restoring the `null`
-
-- A status hook that calls `session.reset()` no longer turns the answer that
-  fired it into a stale request: its caller gets the status it was answered
-  with, and only what is still on its way is dropped
-
-## 2.0.0 — 2026-11-11
+## 2.0.0 — 2026-11-14
 
 The first release of this fork. It continues from upstream RESTe at its
 master (1.7.0 in `package.json`, never published; the last npm release is
@@ -151,6 +63,37 @@ places where behaviour changed.
   side against upstream and this build), a mutation check, a benchmark against
   upstream, an example app with on-device checks
 
+- A two-file build in `split/`: `reste.js` without models, collections,
+  lists and pagination, and `reste.data.js`, read from the same folder when
+  one of them is first used. A cold start that only sends requests loads a
+  little over half of the code
+- `api.preload()` loads that part ahead of time; `api.inspect().loaded.data`
+  says whether an instance has needed it
+
+- A status hook can answer `false`: the response was not its event (one
+  status used for two things), and the firing does not swallow the next
+  response with that status
+- `redact.allow`: names that only look like a credential and may be logged
+
+- `methodOverride` (per instance or per method, off by default): a request
+  the platform cannot send with its body, a `DELETE` on Android, goes out as
+  `POST` with the real method in `X-HTTP-Method-Override` (the header, the
+  methods and "on every platform" are configurable). Retries, hooks, the log
+  and errors still see the method that was asked for
+
+- `api.list({ collection, load })`: a list whose pages come from a function
+  of the app (a service call) instead of a method, over RESTe's collections
+  or any Backbone collection
+- `api.upsert(collection, items)`, `api.replace(model, attributes)` and
+  `api.optimistic(target, attributes, send)`: the collection and model
+  helpers as functions, also for models and collections the app created
+  itself
+
+- A custom `logger` gets the facts of every line about a request as its
+  third argument (`event`, `endpoint`, `method`, `url`, `attempt`, `status`,
+  `kind`, `elapsed`, `duration`, `delay`, `fromCache`): enough to print a line
+  in an app's own format, one per exchange, or to keep request timings
+
 ### Changed
 
 - Sync is scoped to RESTe's models and collections; `Backbone.sync` is no
@@ -176,6 +119,14 @@ places where behaviour changed.
 - A JSON body gets `Content-Type: application/json` when no content type is set
 - Method definitions are analysed on first call; `config()` can be called again
 - The security manager is passed when the HTTP client is created
+
+- Models, collections, lists and pagination are set up on first use instead
+  of in the constructor, in every build; `api.replace()` on a model the app
+  made itself does not need them
+
+- `mapError` is also asked about cancelled and stale requests, so a call
+  rejects with the app's own error class whatever happened to it. Callbacks,
+  hooks and `config.onError` still never hear of such a request
 
 ### Fixed
 
@@ -206,3 +157,44 @@ places where behaviour changed.
 
 See [docs/upstream-audit.md](docs/upstream-audit.md) for each of these with
 the test that covers it.
+
+- A page took rows out of a list, or put them in the wrong place, that it
+  could not know about: it now speaks for the list as it was when the page was
+  asked for
+  - `list.refresh()` dropped a row that had joined while the request was out
+    (a record created while a refresh is in flight, a socket event). It stays,
+    at `place`, until a page asked for after it joined has it or does not. A
+    second `refresh()` that joins the request already out counts from when
+    that request was sent, and a refresh answered after a newer page no longer
+    drops what that page brought
+  - a row that reached the collection while the first page was out never
+    joined: it joins when that page lands
+  - `loadNewer()` put its page after rows that had joined at that end while it
+    was out
+  - a refresh dropped a row the device was still creating
+    (`collection.optimistic()`, an optimistic `create()`) from the list,
+    although the collection kept it
+  - a page put a member back that an unanswered optimistic change had taken
+    out of the list
+  - the temporary id of a row being created was sent as the cursor of
+    `loadNewer()`, `loadOlder()`, `fetchPrevious()` and `fetchNext()`
+  - `collection.refresh()` removed a model that had reached the collection
+    after the refresh was sent
+  - a page that a `reload()` or a later `refresh()` had overtaken left its
+    rows in the list when the `load` function had merged them itself
+  - an unpaginated list with `load` threw on a `refresh()` while another was
+    out, and would have shown the older answer when it arrived last
+
+- A request a status hook had sent again stayed exempt from the next session
+  reset: it is in flight again and dropped with the session like any other
+
+- A response with no freshness left and no validator (`ttl: 0`, or the
+  `'etag'` policy, answered without an `ETag`) was kept, and persisted,
+  although it could never be served again
+
+- Rolling back an optimistic change removed an attribute whose value had been
+  `null` (Backbone's `has()` is false for it) instead of restoring the `null`
+
+- A status hook that calls `session.reset()` no longer turns the answer that
+  fired it into a stale request: its caller gets the status it was answered
+  with, and only what is still on its way is dropped

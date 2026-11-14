@@ -92,11 +92,11 @@ Backbone version Alloy offers is supported: 0.9.2, 1.1.2, 1.3.3, 1.4.0, 1.6.0. M
 and collections need Alloy (or any Backbone passed as `config.Backbone`); plain
 requests need neither.
 
-Copy [`reste.js`](https://github.com/centrevilletech/Ti.ModernRESTe/blob/HEAD/reste.js) into `app/lib/`, or install it from npm in
+Copy [`reste.js`](https://github.com/centrevilletech/Ti.ModernRESTe/blob/HEAD/reste.js) into `app/lib/`, or install it with npm, straight from the release tag, in
 `app/lib`:
 
 ```bash
-cd app/lib && npm install @centrevilletech/reste
+cd app/lib && npm install github:centrevilletech/Ti.ModernRESTe#v2.0.0
 ```
 
 ```javascript
